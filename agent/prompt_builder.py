@@ -297,6 +297,27 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Turn-budget guidance — tells the model to conserve API calls.
+# This session has a limited iteration budget (~30 turns).  The model should
+# structure its work to finish within that budget by batching and parallelising.
+# execute_code turns are *refunded* (don't count against the budget), so
+# multi-step scripting is preferred over sequential tool calls.
+TURN_BUDGET_GUIDANCE = (
+    "# Turn budget\n"
+    "You have approximately 30 API calls per session — use them efficiently.\n"
+    "- Make parallel tool calls when the operations are independent (reading multiple "
+    "files, searching in parallel, starting independent downloads).\n"
+    "- Use execute_code for multi-step scripting (installing deps + running tests + "
+    "checking output — all in one script). execute_code iterations do NOT count "
+    "against your turn budget.\n"
+    "- Use delegate_task for independent subtasks that don't need your full context "
+    "(research in one subagent while you build in another).\n"
+    "- Skip unnecessary confirmation turns: if the next obvious step is safe, just "
+    "do it instead of asking 'shall I proceed?'.\n"
+    "- If you're running out of turns, prefer one execute_code script that batches "
+    "remaining work over sequential tool calls."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

@@ -224,3 +224,163 @@ def test_deepseek_v4_pro_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48
+
+
+# ── Route model cost estimation tests ─────────────────────────────────
+# These verify that estimate_usage_cost returns the correct dollar amount
+# for the specific models used in dynamic route classification (PR2-PR6).
+# The parent fix (conversation_loop.py) ensures this function is called
+# with the actual route model (not the default model) so the pricing
+# below matches what the API call was billed.
+# See: conversation_loop.py _call_model logic (~L1939).
+
+
+def test_claude_sonnet_4_pricing_on_openrouter(monkeypatch):
+    """Route: code_debug → anthropic/claude-sonnet-4 → $3/$15 per M.
+
+    50,000 input + 100 output tokens should cost ~$0.15.
+    """
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "anthropic/claude-sonnet-4": {
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                }
+            }
+        },
+    )
+
+    result = estimate_usage_cost(
+        "anthropic/claude-sonnet-4",
+        CanonicalUsage(input_tokens=50000, output_tokens=100),
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 50,000 × $3.00/M + 100 × $15.00/M = $0.15 + $0.0015
+    assert abs(float(result.amount_usd) - 0.1515) < 0.001
+
+
+def test_claude_sonnet_4_cache_pricing_on_openrouter(monkeypatch):
+    """Route: code_debug → claude-sonnet-4 with cache hits."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "anthropic/claude-sonnet-4": {
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                    "input_cache_read": "0.0000003",
+                    "input_cache_write": "0.00000375",
+                }
+            }
+        },
+    )
+
+    result = estimate_usage_cost(
+        "anthropic/claude-sonnet-4",
+        CanonicalUsage(
+            input_tokens=30000,
+            output_tokens=100,
+            cache_read_tokens=20000,
+            cache_write_tokens=5000,
+        ),
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 30,000 × $3.00/M = $0.09
+    # + 20,000 × $0.30/M = $0.006
+    # + 5,000 × $3.75/M = $0.01875
+    # + 100 × $15.00/M = $0.0015
+    # Total: $0.11625
+    assert abs(float(result.amount_usd) - 0.11625) < 0.001
+
+
+def test_deepseek_v4_flash_pricing_via_openrouter(monkeypatch):
+    """Default model: deepseek/deepseek-v4-flash → cheap pricing.
+
+    This is the baseline — when routing is disabled or unmatched,
+    cost is calculated against the default model.
+    """
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "deepseek/deepseek-v4-flash": {
+                "pricing": {
+                    "prompt": "0.0000000983",
+                    "completion": "0.0000001966",
+                }
+            }
+        },
+    )
+
+    result = estimate_usage_cost(
+        "deepseek/deepseek-v4-flash",
+        CanonicalUsage(input_tokens=50000, output_tokens=100),
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 50,000 × $0.0983/M + 100 × $0.1966/M = $0.004915 + $0.000020
+    assert abs(float(result.amount_usd) - 0.004935) < 0.001
+
+
+def test_gemini_25_flash_pricing_via_openrouter(monkeypatch):
+    """Route: summary → google/gemini-2.5-flash → $0.30/$2.50 per M."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "google/gemini-2.5-flash": {
+                "pricing": {
+                    "prompt": "0.0000003",
+                    "completion": "0.0000025",
+                }
+            }
+        },
+    )
+
+    result = estimate_usage_cost(
+        "google/gemini-2.5-flash",
+        CanonicalUsage(input_tokens=10000, output_tokens=500),
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 10,000 × $0.30/M + 500 × $2.50/M = $0.003 + $0.00125 = $0.00425
+    assert abs(float(result.amount_usd) - 0.00425) < 0.0001
+
+
+def test_unknown_model_returns_null_cost():
+    """Models not in any pricing table → status='unknown', amount=None."""
+    result = estimate_usage_cost(
+        "nonexistent/model-v99",
+        CanonicalUsage(input_tokens=5000, output_tokens=200),
+        provider="openrouter",
+    )
+
+    assert result.status == "unknown"
+    assert result.amount_usd is None
+
+
+def test_subscription_route_returns_zero_cost():
+    """Routes resolved as subscription_included → $0.00."""
+    result = estimate_usage_cost(
+        "gpt-5.3-codex",
+        CanonicalUsage(input_tokens=50000, output_tokens=1000),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    assert result.status == "included"
+    assert float(result.amount_usd) == 0.0

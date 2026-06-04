@@ -416,6 +416,13 @@ def run_conversation(
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
 
+    # Reset per-turn model-level fallback tracking so stale state from a
+    # previous turn doesn't leak into the next turn's usage log.
+    agent._fallback_attempted = False
+    agent._fallback_from_model = ""
+    agent._fallback_to_model = ""
+    agent._fallback_reason = ""
+
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
     # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
@@ -491,6 +498,31 @@ def run_conversation(
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview,
     )
+
+    # ── Context trimming (PR3) ──────────────────────────────────────
+    # Limit history messages sent to the LLM. 0 = disabled.
+    # Logs how many messages and estimated tokens were trimmed.
+    _trimmed_count = 0
+    _raw_history = conversation_history[:] if conversation_history else []
+    _trim_n = getattr(agent, "_trim_to_last_n", 0)
+    if (
+        _trim_n > 0
+        and isinstance(conversation_history, list)
+        and len(conversation_history) > _trim_n
+    ):
+        _before_tokens = estimate_messages_tokens_rough(conversation_history)
+        # Keep only the last N messages.
+        conversation_history = conversation_history[-_trim_n:]
+        _after_tokens = estimate_messages_tokens_rough(conversation_history)
+        _trimmed_count = len(_raw_history) - len(conversation_history)
+        _saved_est = _before_tokens - _after_tokens
+        logger.info(
+            "Context trim: trimmed %d messages, saved ~%d tokens "
+            "(history=%d->%d)",
+            _trimmed_count, _saved_est,
+            len(_raw_history), len(conversation_history),
+        )
+        agent._trimmed_count = _trimmed_count
 
     # Initialize conversation (copy to avoid mutating the caller's list)
     messages = list(conversation_history) if conversation_history else []
@@ -1153,6 +1185,9 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        # Bug A fix: track model-level fallback state within this retry loop
+        _fallback_active = False
+        _fallback_model_override = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1213,7 +1248,80 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+
+                # ── Dynamic model routing (PR2) ───────────────────────
+                # Classify the message and, when routing is enabled, select
+                # a per-route model.  Model is applied to api_kwargs["model"]
+                # *after* _build_api_kwargs so the built-in provider-resolution
+                # path is unchanged.  agent.model is NEVER permanently altered.
+                _routing_enabled = bool(
+                    getattr(agent, "_routing_config", {}).get("enabled", False)
+                )
+                if _routing_enabled:
+                    from agent.route_classifier import (
+                        classify_message,
+                        get_fallback_route_model,
+                        get_route_model,
+                    )
+                    agent._route_type, agent._classification_reason = classify_message(
+                        original_user_message, messages
+                    )
+                    agent._route_model = get_route_model(
+                        agent._route_type, agent._routing_config
+                    )
+                else:
+                    agent._route_type = "normal_chat"
+                    agent._route_model = ""
+                    agent._classification_reason = ""
+
+                # ── PR4-A: Command Bypass ───────────────────────────────
+                # Intercept simple_command routes and handle them without
+                # calling the LLM.  Requires both routing and command_bypass
+                # to be enabled in config.yaml.
+                if agent._route_type == "simple_command":
+                    from agent.command_bypass import (
+                        handle_simple_command,
+                        is_bypass_enabled,
+                    )
+                    if is_bypass_enabled(agent):
+                        _bypass_result = handle_simple_command(
+                            agent, original_user_message
+                        )
+                        if _bypass_result is not None:
+                            # Close gracefully-open spinner/thinking states
+                            if thinking_spinner:
+                                thinking_spinner.stop("")
+                                thinking_spinner = None
+                            if agent.thinking_callback:
+                                agent.thinking_callback("")
+                            agent._persist_session(messages, conversation_history)
+                            return _bypass_result
+
                 api_kwargs = agent._build_api_kwargs(api_messages)
+
+                # Apply route model to api_kwargs — never touch agent.model.
+                # Bug A fix: when model-level fallback is active, use the
+                # persisted fallback model instead of re-applying the route
+                # model, so the fallback isn't silently lost on retries.
+                # Provider fallback is different: try_activate_fallback()
+                # intentionally mutates agent.provider/agent.model to the
+                # configured fallback target.  In that state, use the optional
+                # fallback routing table if configured; otherwise keep
+                # agent.model from the provider fallback entry.  This prevents
+                # primary-provider route models (e.g. openai-codex/gpt-5.5)
+                # from leaking into fallback providers (e.g. OpenRouter).
+                if _routing_enabled and agent._route_model:
+                    if _fallback_active and _fallback_model_override:
+                        api_kwargs["model"] = _fallback_model_override
+                    elif getattr(agent, "_fallback_activated", False):
+                        _fallback_route_model = get_fallback_route_model(
+                            agent._route_type, agent._routing_config
+                        )
+                        if _fallback_route_model:
+                            api_kwargs["model"] = _fallback_route_model
+                    else:
+                        api_kwargs["model"] = agent._route_model
+
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1253,6 +1361,12 @@ def run_conversation(
                     )
                 except Exception:
                     pass
+
+                # ── Single Source of Truth: actual model used ──────────
+                # Record the model that will actually be sent to the API
+                # after all routing, fallback, and provider overrides.
+                # Used for cost estimation, usage.log, and session DB.
+                agent._actual_model_used = api_kwargs.get("model", "") or agent.model
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -1852,8 +1966,14 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
+                    # ── Cost estimation ───────────────────────────────
+                    # Use _actual_model_used as the Single Source of Truth.
+                    # This is set right before the API call after all
+                    # routing, fallback, and provider overrides have been
+                    # applied to api_kwargs["model"].
+                    _call_model = agent._actual_model_used or agent.model
                     cost_result = estimate_usage_cost(
-                        agent.model,
+                        _call_model,
                         canonical_usage,
                         provider=agent.provider,
                         base_url=agent.base_url,
@@ -1896,7 +2016,7 @@ def run_conversation(
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
-                                model=agent.model,
+                                model=_call_model,
                                 api_call_count=1,
                             )
                         except Exception as e:
@@ -1932,7 +2052,40 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
-                
+
+                    # ── Structured usage log (PR1) ───────────────────────
+                    # One JSON line per API call; off by default.
+                    # Enable via usage_log_path in config.yaml.
+                    from agent.usage_logger import log_llm_call
+                    _logged_model = _call_model
+                    log_llm_call(
+                        model=_logged_model,
+                        provider=agent.provider or "unknown",
+                        input_tokens=canonical_usage.input_tokens,
+                        output_tokens=canonical_usage.output_tokens,
+                        total_tokens=canonical_usage.total_tokens,
+                        estimated_cost_usd=(
+                            float(cost_result.amount_usd)
+                            if cost_result.amount_usd is not None
+                            else None
+                        ),
+                        latency_ms=api_duration * 1000,
+                        route_type=getattr(agent, "_route_type", "normal_chat"),
+                        classification_reason=getattr(agent, "_classification_reason", ""),
+                        channel=getattr(agent, "platform", ""),
+                        trimmed_messages=getattr(agent, "_trimmed_count", 0),
+                        cache_read_tokens=canonical_usage.cache_read_tokens,
+                        cache_write_tokens=canonical_usage.cache_write_tokens,
+                        reasoning_tokens=canonical_usage.reasoning_tokens,
+                        # Fallback context — populated when model-level fallback was triggered
+                        fallback_triggered=getattr(agent, "_fallback_attempted", False),
+                        fallback_model=getattr(agent, "_fallback_to_model", ""),
+                        fallback_from_model=getattr(agent, "_fallback_from_model", ""),
+                        fallback_to_model=getattr(agent, "_fallback_to_model", ""),
+                        fallback_reason=getattr(agent, "_fallback_reason", ""),
+                        attempt_number=2 if getattr(agent, "_fallback_attempted", False) else 1,
+                    )
+
                 has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
@@ -3247,6 +3400,85 @@ def run_conversation(
                         primary_recovery_attempted = True
                         retry_count = 0
                         continue
+                    # ── Model-level fallback escalation (PR5) ──────────────
+                    # When fallback is enabled and a fallback model is
+                    # configured for the current model, switch to the
+                    # fallback model on transient errors instead of giving
+                    # up.  Only fires once per API call block (guarded by
+                    # agent._fallback_attempted).
+                    if (
+                        not getattr(agent, "_fallback_attempted", False)
+                        and isinstance(api_kwargs, dict)
+                    ):
+                        _current_model = api_kwargs.get("model", "")
+                        if _current_model:
+                            try:
+                                from agent.fallback_escalation import (
+                                    get_fallback_model,
+                                    is_fallback_enabled,
+                                    is_transient_api_error,
+                                    derive_fallback_reason,
+                                )
+                                if (
+                                    is_fallback_enabled()
+                                    and is_transient_api_error(api_error, status_code)
+                                ):
+                                    _fallback_model = get_fallback_model(_current_model)
+                                    if _fallback_model:
+                                        agent._fallback_attempted = True
+                                        agent._fallback_from_model = _current_model
+                                        agent._fallback_to_model = _fallback_model
+                                        agent._fallback_reason = derive_fallback_reason(
+                                            classified, api_error, status_code,
+                                        )
+                                        api_kwargs["model"] = _fallback_model
+                                        _fallback_model_override = _fallback_model  # Bug A fix
+                                        _fallback_active = True
+                                        retry_count = 0
+                                        compression_attempts = 0
+                                        primary_recovery_attempted = False
+                                        agent._buffer_status(
+                                            f"⚠️ {_current_model} failed — "
+                                            f"trying fallback model {_fallback_model}..."
+                                        )
+                                        logger.info(
+                                            "Fallback escalation: %s → %s "
+                                            "(error=%s, status=%s)",
+                                            _current_model, _fallback_model,
+                                            type(api_error).__name__, status_code,
+                                        )
+                                        # Log the failed primary attempt to usage log
+                                        # so cost comparison is possible.
+                                        try:
+                                            from agent.usage_logger import log_llm_call as _log_fallback
+                                            _log_fallback(
+                                                model=_current_model,
+                                                provider=getattr(agent, "provider", "unknown"),
+                                                input_tokens=0,
+                                                output_tokens=0,
+                                                total_tokens=0,
+                                                estimated_cost_usd=0.0,
+                                                latency_ms=(time.time() - api_start_time) * 1000 if api_start_time else 0,
+                                                route_type=getattr(agent, "_route_type", "normal_chat"),
+                                                classification_reason=getattr(agent, "_classification_reason", ""),
+                                                channel=getattr(agent, "platform", ""),
+                                                status="fallback_escalated",
+                                                fallback_triggered=True,
+                                                fallback_model=_fallback_model,
+                                                attempt_number=retry_count,
+                                                fallback_from_model=_current_model,
+                                                fallback_to_model=_fallback_model,
+                                                fallback_reason=derive_fallback_reason(
+                                                    classified, api_error, status_code,
+                                                ),
+                                            )
+                                        except Exception:
+                                            pass
+                                        continue
+                            except ImportError:
+                                pass
+                            except Exception:
+                                pass
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
@@ -3254,6 +3486,8 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
+                        _fallback_active = False  # Bug B fix: provider fallback supersedes model-level
+                        _fallback_model_override = None  # reset stale model fallback state
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()

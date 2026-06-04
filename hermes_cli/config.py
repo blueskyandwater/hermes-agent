@@ -675,6 +675,39 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Dynamic model routing — route messages to different models based on
+    # content classification.  Disabled by default.  When enabled, each
+    # route can specify a different model for the primary provider API call.
+    # ``fallback_routes`` is optional and only applies after provider fallback
+    # activates, preventing primary-provider route models from leaking into a
+    # fallback provider.
+    # See agent/route_classifier.py for the classification rules.
+    # Set routing.enabled: true and add model overrides to activate.
+    "routing": {
+        "enabled": False,
+        "normal_chat": {},
+        "code_or_debug": {},
+        "summary": {},
+        "long_context": {},
+        "research": {},
+        "simple_command": {},
+        "fallback_routes": {},
+    },
+    # Command bypass — handle known slash commands (／help, ／status, ／sethome)
+    # without calling the LLM.  Only active when ``routing.enabled`` is also true.
+    "command_bypass": {
+        "enabled": True,
+    },
+    # Model-level fallback escalation — when a model fails with a
+    # transient error (timeout, 5xx, 429), retry with an alternate
+    # model on the same provider.  Disabled by default.
+    # ``max_attempts``: 1 = primary only (no fallback), 2 = primary + fallback.
+    # ``models``: mapping of primary_model → {fallback: fallback_model}.
+    "fallback": {
+        "enabled": False,
+        "max_attempts": 2,
+        "models": {},
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -2149,8 +2182,20 @@ DEFAULT_CONFIG = {
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
 
+    # Conversation context trimming — limits the number of history messages
+    # sent to the LLM on each turn.  The system prompt + current user message
+    # are never trimmed.  0 = disabled (send full history).
+    "context": {
+        "trim_to_last_n": 0,
+    },
 
-    # Config schema version - bump this when adding new required fields
+    # Path for per-request structured usage log (JSONL).
+    # One line per LLM API call.  Disabled by default.
+    # Relative paths resolve against $HERMES_HOME.
+    "usage_log_path": "",
+
+    # Config schema version - bump this when adding new required fields.
+    # Increment if you backport config.py changes to old configs.""",
     "_config_version": 25,
 }
 

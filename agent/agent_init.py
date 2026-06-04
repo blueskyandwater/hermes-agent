@@ -1047,6 +1047,15 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # ── Initialise usage logger (PR1) ───────────────────────────────
+    # Reads usage_log_path from config; no-op when path is empty.
+    try:
+        from agent.usage_logger import init_usage_log as _init_usage_log
+        _init_usage_log(_agent_cfg)
+    except Exception:
+        pass
+
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
@@ -1055,6 +1064,53 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+    # ── Dynamic model routing config (PR2) ───────────────────────────
+    # Stored on the agent so conversation_loop can classify + select
+    # model without re-reading the YAML file on every turn.
+    agent._routing_config = _agent_cfg.get("routing", {})
+    if not isinstance(agent._routing_config, dict):
+        agent._routing_config = {}
+    agent._route_type = "normal_chat"          # default until classified
+    agent._route_model = ""                     # resolved per-turn model
+    agent._classification_reason = ""            # why this route was chosen (PR6)
+    agent._actual_model_used = agent.model       # Single Source of Truth: model actually sent to API
+
+    # ── Context trimming config (PR3) ────────────────────────────────
+    # Limits the number of history messages sent to the LLM per turn.
+    # 0 = disabled (send all history).
+    try:
+        _context_cfg = _agent_cfg.get("context", {})
+        if isinstance(_context_cfg, dict):
+            agent._trim_to_last_n = int(_context_cfg.get("trim_to_last_n", 0))
+        else:
+            agent._trim_to_last_n = 0
+    except Exception:
+        agent._trim_to_last_n = 0
+
+    # ── Command bypass config (PR4-A) ──────────────────────────────────
+    # Controls whether known slash commands (／help, ／status, ／sethome)
+    # are handled without calling the LLM.
+    try:
+        _bypass_cfg = _agent_cfg.get("command_bypass", {})
+        if isinstance(_bypass_cfg, dict):
+            agent._command_bypass_enabled = bool(_bypass_cfg.get("enabled", True))
+        else:
+            agent._command_bypass_enabled = True
+    except Exception:
+        agent._command_bypass_enabled = True
+
+    # ── Fallback escalation config (PR5) ────────────────────────────────
+    # Loads the model-level fallback mapping so that on transient API
+    # errors (timeout, 5xx, 429) the conversation loop can retry with an
+    # alternate model without restarting the session.
+    try:
+        from agent.fallback_escalation import init_fallback_config
+        init_fallback_config(_agent_cfg)
+        agent._fallback_attempted = False
+    except Exception:
+        pass
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.
