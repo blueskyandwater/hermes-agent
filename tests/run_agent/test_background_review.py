@@ -267,6 +267,58 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     )
 
 
+def test_background_review_inherits_fallback_chain_and_guards_code_light_routing(monkeypatch):
+    captured: dict = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model", "")
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured["fallback_chain"] = list(self._fallback_chain)
+            captured["fallback_index"] = self._fallback_index
+            captured["fallback_model"] = self._fallback_model
+            captured["routing_config"] = dict(self._routing_config)
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent.model = "gpt-5.5"
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+    ]
+    agent._fallback_index = 0
+    agent._fallback_activated = False
+    agent._routing_config = {
+        "enabled": True,
+        "code_light": {"model": "gpt-5.3-codex-spark"},
+        "long_context": {"model": "gpt-5.5"},
+    }
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert captured["fallback_chain"] == agent._fallback_chain
+    assert captured["fallback_index"] == 0
+    assert captured["fallback_model"] == agent._fallback_chain[0]
+    assert captured["routing_config"]["code_light"] == {
+        "model": "gpt-5.5",
+        "background_review_guard": True,
+    }
+
+
 def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
     """The background review fork must NOT touch external memory plugins.
 

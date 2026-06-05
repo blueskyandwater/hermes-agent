@@ -10,17 +10,19 @@ Routes (priority order — first match wins)
 -------------------------------------------
 1.  simple_command         Leading ``/`` + word (Hermes slash command)
 2.  vision                 Image content detected in the message
-3.  code_implementation    Feature implementation, testing, patching
-4.  code_design            Architecture, design, planning, PR split
-5.  code_debug             Traceback, stack trace, error analysis, log investigation
-6.  code_light             Simple import/install issues, command checks, usage queries
-7.  code_or_debug          (catch-all) Remaining code, debug, generic tech triggers
-8.  summary                Summarisation, TL;DR, meeting notes
-9.  research               Research-heavy, deep investigation
-|10. long_context           Long document analysis (>2000 chars or explicit)
-|11. complex_task           ``estimate_complexity() >= 4`` — complex prompts that
-|                           no keyword matched (e.g. multi-step, high tech density)
-|12. normal_chat            DEFAULT — everyday conversation, casual Q&A
+3.  code_design            Architecture, design, planning, PR split
+4.  large_implementation   Large feature implementation (explicit size keywords
+                            OR implementation intent + complexity heuristics)
+5.  code_implementation    Feature implementation, testing, patching
+6.  code_debug             Traceback, stack trace, error analysis, log investigation
+7.  code_light             Simple import/install issues, command checks, usage queries
+8.  code_or_debug          (catch-all) Remaining code, debug, generic tech triggers
+9.  summary                Summarisation, TL;DR, meeting notes
+10. research               Research-heavy, deep investigation
+11. long_context           Long document analysis (>2000 chars or explicit)
+12. complex_task           ``estimate_complexity() >= 4`` — complex prompts that
+                            no keyword matched (e.g. multi-step, high tech density)
+13. normal_chat            DEFAULT — everyday conversation, casual Q&A
 
 Future routes (classified but not yet associated with a model)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -89,8 +91,25 @@ _CODE_IMPL_TRIGGERS = (
     "パッチを作", "パッチを書", "パッチして",
     "テスト追加", "テストを追加", "テストを書",
     "pytestを追加", "diffを確認",
-    "機能を作", "機能を追加", "機能実装",
+    "機能を作", "機能を追加", "機能実装", "機能追加",
     "関数を作", "クラスを作", "メソッドを書",
+)
+
+# ── large_implementation ───────────────────────────────────────────────
+# Larger coding tasks should be allowed to route to a stronger implementation
+# model.  We intentionally combine explicit size keywords with heuristics so
+# the route catches both obvious requests ("大規模に実装") and naturally phrased
+# multi-step feature asks (schema + API + tests + migration).
+_LARGE_IMPL_SIZE_TRIGGERS = (
+    "大規模", "大きめ", "本格的", "複数ファイル", "複数箇所",
+    "またがる", "全体", "一式", "エンドツーエンド", "end-to-end", "e2e",
+)
+
+_LARGE_IMPL_SCOPE_TRIGGERS = (
+    "新機能", "機能追加", "認証機能", "ユーザー管理", "管理機能",
+    "dbスキーマ", "データベース", "apiエンドポイント", "api endpoint",
+    "endpoint", "migration", "マイグレーション", "schema", "database",
+    "crud", "権限", "認証", "監査ログ",
 )
 
 # ── code_design ────────────────────────────────────────────────────────
@@ -281,6 +300,34 @@ def estimate_complexity(text: str) -> int:
     return min(score, 5)
 
 
+def _is_large_implementation(text: str, lower: str) -> tuple[bool, str]:
+    """Return whether an implementation request is large enough for its own route.
+
+    Uses a hybrid rule:
+    - explicit size/scope keywords + implementation intent → large
+    - implementation intent + complexity/length/scope signals → large
+    """
+    has_impl_intent = any(trigger in lower for trigger in _CODE_IMPL_TRIGGERS)
+    has_size_signal = any(trigger in lower for trigger in _LARGE_IMPL_SIZE_TRIGGERS)
+    scope_hits = sum(1 for trigger in _LARGE_IMPL_SCOPE_TRIGGERS if trigger in lower)
+
+    if has_impl_intent and has_size_signal:
+        return True, "keyword:large_implementation"
+
+    if not has_impl_intent:
+        return False, ""
+
+    complexity = estimate_complexity(text)
+    numbered = len(re.findall(r"\d\.\s", text))
+    comma_steps = sum(1 for marker in ("まず", "次に", "その後", "最後に", "まで") if marker in lower)
+    if complexity >= 4 and (len(text) > 100 or scope_hits >= 2 or numbered >= 3 or comma_steps >= 3):
+        return True, f"large_heuristic:complexity:{complexity}/5"
+    if scope_hits >= 2:
+        return True, "keyword:large_implementation"
+
+    return False, ""
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -289,6 +336,8 @@ def estimate_complexity(text: str) -> int:
 def classify_message(
     text: str,
     history: Optional[list] = None,
+    *,
+    context_token_estimate: Optional[int] = None,
 ) -> tuple[str, str]:
     """Return ``(route_type, classification_reason)`` for *text*.
 
@@ -300,6 +349,10 @@ def classify_message(
         Message list to check for image content.  When an image is detected
         the message is classified as ``vision`` so it can be routed to a
         vision-capable model.
+    context_token_estimate : int or None
+        Rough token count for the full request context.  Used to keep
+        lightweight code routes (notably ``code_light``) from selecting tiny
+        models on large, history-heavy turns.
 
     Returns
     -------
@@ -331,49 +384,68 @@ def classify_message(
         if trigger in _lower:
             return "code_design", "keyword:code_design"
 
-    # 4. code_implementation — specific asks to write code
+    # 4. large_implementation — explicit size keywords OR combined heuristics
+    is_large_impl, large_impl_reason = _is_large_implementation(text, _lower)
+    if is_large_impl:
+        return "large_implementation", large_impl_reason
+
+    # 5. code_implementation — specific asks to write code
     for trigger in _CODE_IMPL_TRIGGERS:
         if trigger in _lower:
             return "code_implementation", "keyword:code_implementation"
 
-    # 5. code_debug — traceback, log analysis, investigation
+    # 6. code_debug — traceback, log analysis, investigation
     for trigger in _CODE_DEBUG_TRIGGERS:
         if trigger in _lower:
             return "code_debug", "keyword:code_debug"
 
-    # 6. code_light — simple import/install/usage issues
+    # 7. code_light — simple import/install/usage issues
+    # Keep this route truly lightweight.  Some small/fast coding models work
+    # for direct one-off command/import questions but reject or degrade on a
+    # large accumulated conversation context.  In that case route by context
+    # size instead of the local keyword so config can send it to a long-context
+    # capable model.
+    _CODE_LIGHT_MAX_CONTEXT_TOKENS = 6_000
     for trigger in _CODE_LIGHT_TRIGGERS:
         if trigger in _lower:
+            if (
+                context_token_estimate is not None
+                and context_token_estimate > _CODE_LIGHT_MAX_CONTEXT_TOKENS
+            ):
+                return (
+                    "long_context",
+                    f"context_tokens>{_CODE_LIGHT_MAX_CONTEXT_TOKENS}:code_light_guard",
+                )
             return "code_light", "keyword:code_light"
 
-    # 7. code_or_debug — generic code triggers (catch-all)
+    # 8. code_or_debug — generic code triggers (catch-all)
     for trigger in _CODE_TRIGGERS:
         if trigger in _lower:
             return "code_or_debug", "keyword:code_or_debug"
 
-    # 8. research — narrow match first
+    # 9. research — narrow match first
     for trigger in _RESEARCH_TRIGGERS:
         if trigger in _lower:
             return "research", "keyword:research"
 
-    # 9. summary — summarisation requests (before long_context)
+    # 10. summary — summarisation requests (before long_context)
     for trigger in _SUMMARY_TRIGGERS:
         if trigger in _lower:
             return "summary", "keyword:summary"
 
-    # 10. long_context — explicit long document requests
+    # 11. long_context — explicit long document requests
     if len(text) > 2000:
         return "long_context", "length>2000"
     for trigger in _LONG_CONTEXT_TRIGGERS:
         if trigger in _lower:
             return "long_context", "keyword:long_context"
 
-    # 11. Complexity-based routing — catch complex prompts that no keyword matched
+    # 12. Complexity-based routing — catch complex prompts that no keyword matched
     complexity = estimate_complexity(text)
     if complexity >= 5:
         return "complex_task", f"complexity:{complexity}/5"
 
-    # 12. Default
+    # 13. Default
     return "normal_chat", ""
 
 
@@ -384,6 +456,7 @@ def classify_message(
 # entry, it falls back to the parent route's model.  This lets usage.log
 # observe the new routes without requiring config.yaml changes.
 _ROUTE_MODEL_ALIASES = {
+    "large_implementation": "code_or_debug",
     "code_implementation": "code_or_debug",
     "code_design": "code_or_debug",
     "code_debug": "code_or_debug",
@@ -496,6 +569,7 @@ def get_route_type_strings() -> tuple[str, ...]:
         "simple_command",
         "normal_chat",
         "vision",
+        "large_implementation",
         "code_implementation",
         "code_design",
         "code_debug",

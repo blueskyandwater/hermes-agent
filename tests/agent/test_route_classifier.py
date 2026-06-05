@@ -248,6 +248,34 @@ class TestCodeImplementation:
         assert rsn == reason
 
 
+class TestLargeImplementation:
+    @pytest.mark.parametrize("text", [
+        "認証機能を大規模に実装して",
+        "複数ファイルにまたがる新機能を実装して",
+        "DBスキーマ、APIエンドポイント、テストまで含めて機能追加して",
+    ])
+    def test_explicit_large_implementation_keywords(self, text):
+        route, rsn = classify_message(text)
+        assert route == "large_implementation", f"'{text}' → {route}"
+        assert rsn == "keyword:large_implementation"
+
+    def test_large_implementation_by_combined_heuristics(self):
+        text = (
+            "ユーザー管理機能を実装して。"
+            "まずdatabase schemaを追加して、次にAPI endpointを作り、"
+            "その後migrationとpytestも追加して、最後にconfig更新までお願いします。"
+            "要件: 1. CRUD 2. 認証 3. 監査ログ"
+        )
+        route, rsn = classify_message(text)
+        assert route == "large_implementation"
+        assert rsn.startswith("large_heuristic:")
+
+    def test_small_implementation_stays_code_implementation(self):
+        route, rsn = classify_message("テストを追加して")
+        assert route == "code_implementation"
+        assert rsn == "keyword:code_implementation"
+
+
 # =========================================================================
 # code_design
 # =========================================================================
@@ -599,6 +627,37 @@ class TestEdgeCases:
 # =========================================================================
 
 
+class TestCodeLightContextGuard:
+    def test_short_context_keeps_code_light(self):
+        route, rsn = classify_message(
+            "pip install の使い方を教えて",
+            context_token_estimate=2_000,
+        )
+        assert route == "code_light"
+        assert rsn == "keyword:code_light"
+
+    def test_large_context_routes_code_light_to_long_context(self):
+        route, rsn = classify_message(
+            "pip install の使い方を教えて",
+            context_token_estimate=30_000,
+        )
+        assert route == "long_context"
+        assert rsn == "context_tokens>6000:code_light_guard"
+
+    def test_observed_spark_failure_zone_routes_away_from_code_light(self):
+        route, rsn = classify_message(
+            "pip install の使い方を教えて",
+            context_token_estimate=9_040,
+        )
+        assert route == "long_context"
+        assert rsn == "context_tokens>6000:code_light_guard"
+
+    def test_missing_context_estimate_preserves_legacy_code_light(self):
+        route, rsn = classify_message("pip install の使い方を教えて")
+        assert route == "code_light"
+        assert rsn == "keyword:code_light"
+
+
 class TestGetRouteModel:
     def test_returns_configured_model(self):
         config = {"research": {"model": "perplexity/sonar"}}
@@ -612,12 +671,20 @@ class TestGetRouteModel:
         assert get_route_model("research", config) == "deepseek/deepseek-v4-flash"
 
     def test_sub_route_aliases_to_parent(self):
-        """code_implementation aliases to code_or_debug model."""
+        """code implementation sub-routes alias to code_or_debug model."""
         config = {"code_or_debug": {"model": "deepseek/deepseek-v4-flash"}}
         assert get_route_model("code_implementation", config) == "deepseek/deepseek-v4-flash"
+        assert get_route_model("large_implementation", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_design", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_debug", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_light", config) == "deepseek/deepseek-v4-flash"
+
+    def test_large_implementation_can_have_dedicated_model(self):
+        config = {
+            "large_implementation": {"model": "openai-codex/gpt-5.5"},
+            "code_or_debug": {"model": "deepseek/deepseek-v4-flash"},
+        }
+        assert get_route_model("large_implementation", config) == "openai-codex/gpt-5.5"
 
 
 class TestGetFallbackRouteModel:
@@ -645,6 +712,7 @@ class TestGetFallbackRouteModel:
             },
         }
         assert get_fallback_route_model("code_implementation", config) == "deepseek/deepseek-v4-pro"
+        assert get_fallback_route_model("large_implementation", config) == "deepseek/deepseek-v4-pro"
 
     def test_empty_when_no_fallback_route_configured(self):
         config = {"normal_chat": {"model": "gpt-5.5"}}
@@ -664,7 +732,7 @@ class TestGetRouteTypeStrings:
     def test_includes_all_active_routes(self):
         routes = get_route_type_strings()
         required = {"simple_command", "normal_chat", "vision",
-                     "code_implementation", "code_design",
-                     "code_debug", "code_light", "code_or_debug",
+                     "code_implementation", "large_implementation",
+                     "code_design", "code_debug", "code_light", "code_or_debug",
                      "summary", "research", "long_context"}
         assert required.issubset(set(routes))

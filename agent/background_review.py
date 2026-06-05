@@ -416,6 +416,46 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # The review fork is an auxiliary self-improvement pass, but it still
+            # makes real model calls with memory/skill side effects.  Inherit the
+            # parent's provider fallback chain so a provider/model error (for
+            # example a Codex route model rejecting the accumulated context) can
+            # recover instead of failing silently at end-of-turn.
+            review_agent._fallback_chain = [
+                dict(entry) for entry in (getattr(agent, "_fallback_chain", None) or [])
+                if isinstance(entry, dict)
+            ]
+            review_agent._fallback_index = getattr(agent, "_fallback_index", 0)
+            review_agent._fallback_model = (
+                review_agent._fallback_chain[review_agent._fallback_index]
+                if review_agent._fallback_index < len(review_agent._fallback_chain)
+                else None
+            )
+            review_agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+            # Guard bg-review routing away from code_light-specific tiny models.
+            # The review prompt is short, but the inherited conversation history
+            # can be huge; code_light models may work for direct command/import
+            # questions and still reject 30k+ token review contexts.
+            _parent_routing = getattr(agent, "_routing_config", {})
+            if isinstance(_parent_routing, dict):
+                _review_routing = dict(_parent_routing)
+                _guard_model = ""
+                for _route in ("long_context", "complex_task", "normal_chat"):
+                    _cfg = _review_routing.get(_route, {})
+                    if isinstance(_cfg, dict) and _cfg.get("model"):
+                        _guard_model = _cfg["model"]
+                        break
+                    if isinstance(_cfg, str) and _cfg:
+                        _guard_model = _cfg
+                        break
+                if not _guard_model:
+                    _guard_model = getattr(agent, "model", "") or getattr(review_agent, "model", "")
+                if _guard_model:
+                    _review_routing["code_light"] = {
+                        "model": _guard_model,
+                        "background_review_guard": True,
+                    }
+                review_agent._routing_config = _review_routing
             review_agent._memory_store = agent._memory_store
             review_agent._memory_enabled = agent._memory_enabled
             review_agent._user_profile_enabled = agent._user_profile_enabled
@@ -528,7 +568,21 @@ def _run_review_in_thread(
                     pass
 
     except Exception as e:
-        logger.warning("Background memory/skill review failed: %s", e)
+        _route_type = getattr(review_agent, "_route_type", "") if review_agent is not None else ""
+        _route_model = getattr(review_agent, "_route_model", "") if review_agent is not None else ""
+        _actual_model = getattr(review_agent, "_actual_model_used", "") if review_agent is not None else ""
+        _fallback_chain = getattr(review_agent, "_fallback_chain", None) if review_agent is not None else None
+        _fallback_index = getattr(review_agent, "_fallback_index", None) if review_agent is not None else None
+        logger.warning(
+            "Background memory/skill review failed: %s | actual_model=%s "
+            "route_type=%s route_model=%s fallback_chain=%s fallback_index=%s",
+            e,
+            _actual_model or getattr(agent, "model", ""),
+            _route_type or "unknown",
+            _route_model or "",
+            bool(_fallback_chain),
+            _fallback_index,
+        )
         agent._emit_auxiliary_failure("background review", e)
     finally:
         # Safety-net cleanup for the exception path.  Normal
