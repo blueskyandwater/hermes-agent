@@ -354,6 +354,40 @@ class TestProviderFallbackConsistency:
         assert call_models[0] == "gpt-5.5"
         assert call_models[-1] == "deepseek/deepseek-v4-flash"
 
+    def test_gateway_runtime_provider_fallback_uses_fallback_routes(self, monkeypatch):
+        """Gateway-resolved fallback must not send primary route models to OpenRouter.
+
+        When the gateway resolves OpenRouter fallback before AIAgent init,
+        the agent is constructed directly with the fallback model/provider and
+        ``_fallback_activated`` is false.  The gateway marks this bootstrap
+        state with ``_runtime_provider_fallback_active`` so routing uses
+        ``routing.fallback_routes`` instead of the primary Codex route model.
+        """
+        agent = _make_agent(model="deepseek/deepseek-v4-flash", provider="openrouter")
+        _enable_routing(agent, route_model="gpt-5.5")
+        agent._routing_config["fallback_routes"] = {
+            "normal_chat": {"model": "deepseek/deepseek-v4-flash"},
+        }
+        agent._fallback_activated = False
+        agent._runtime_provider_fallback_active = True
+
+        resp = _mock_response(
+            content="Runtime fallback response",
+            model="deepseek/deepseek-v4-flash",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert agent._actual_model_used == "deepseek/deepseek-v4-flash"
+        assert agent.client.chat.completions.create.call_args.kwargs["model"] == "deepseek/deepseek-v4-flash"
+
 
 # ---------------------------------------------------------------------------
 # Case 7: cost estimation consistency

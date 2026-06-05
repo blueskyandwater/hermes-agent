@@ -1322,7 +1322,7 @@ def run_conversation(
                 if _routing_enabled and agent._route_model:
                     if _fallback_active and _fallback_model_override:
                         api_kwargs["model"] = _fallback_model_override
-                    elif getattr(agent, "_fallback_activated", False):
+                    elif getattr(agent, "_fallback_activated", False) or getattr(agent, "_runtime_provider_fallback_active", False):
                         _fallback_route_model = get_fallback_route_model(
                             agent._route_type, agent._routing_config
                         )
@@ -1402,7 +1402,7 @@ def run_conversation(
                     agent._actual_model_used,
                     getattr(agent, "provider", ""),
                     getattr(agent, "_route_type", "") or "normal_chat",
-                    bool(getattr(agent, "_fallback_activated", False)),
+                    bool(getattr(agent, "_fallback_activated", False) or getattr(agent, "_runtime_provider_fallback_active", False)),
                     len(getattr(agent, "_fallback_chain", []) or []),
                 )
 

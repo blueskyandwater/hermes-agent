@@ -1256,6 +1256,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    "_runtime_provider_fallback_active": True,
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -2697,6 +2698,9 @@ class GatewayRunner:
         route = {
             "model": model,
             "runtime": runtime,
+            "runtime_provider_fallback_active": bool(
+                runtime_kwargs.get("_runtime_provider_fallback_active")
+            ),
             "signature": (
                 model,
                 runtime["provider"],
@@ -17836,6 +17840,9 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent._runtime_provider_fallback_active = bool(
+                turn_route.get("runtime_provider_fallback_active")
+            )
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
