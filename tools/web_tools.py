@@ -130,7 +130,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "local"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -212,11 +212,20 @@ def _is_backend_available(backend: str) -> bool:
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
         # can trigger a network token refresh, and _is_backend_available
-        # runs on every web_search dispatch + every `hermes tools` repaint.
+        # runs on every web_search dispatch + every `hermes tools` paint.
         try:
             from tools.xai_http import has_xai_credentials
             return has_xai_credentials()
         except Exception:
+            return False
+    if backend == "local":
+        # httpx is always available in the Hermes venv; the actual
+        # extraction libs (trafilatura, readability, bs4, PyMuPDF)
+        # are optional — the provider falls back gracefully.
+        try:
+            import httpx  # noqa: F401
+            return True
+        except ImportError:
             return False
     return False
 
@@ -977,7 +986,7 @@ async def web_extract_tool(
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
                                 "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "tavily, exa, parallel, or local."
                             ),
                         },
                         ensure_ascii=False,
@@ -990,7 +999,7 @@ async def web_extract_tool(
                             "error": (
                                 "No web extract provider configured. "
                                 "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "tavily, exa, parallel, or local."
                             ),
                         },
                         ensure_ascii=False,
@@ -1155,11 +1164,11 @@ async def web_extract_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai", "local"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai", "local")
     )
 
 
