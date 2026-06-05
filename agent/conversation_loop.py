@@ -1271,7 +1271,9 @@ def run_conversation(
                         get_route_model,
                     )
                     agent._route_type, agent._classification_reason = classify_message(
-                        original_user_message, messages
+                        original_user_message,
+                        messages,
+                        context_token_estimate=approx_tokens,
                     )
                     agent._route_model = get_route_model(
                         agent._route_type, agent._routing_config
@@ -1395,6 +1397,14 @@ def run_conversation(
                 # after all routing, fallback, and provider overrides.
                 # Used for cost estimation, usage.log, and session DB.
                 agent._actual_model_used = api_kwargs.get("model", "") or agent.model
+                logger.info(
+                    "API call: model=%s provider=%s route_type=%s fallback_active=%s fallback_chain=%d",
+                    agent._actual_model_used,
+                    getattr(agent, "provider", ""),
+                    getattr(agent, "_route_type", "") or "normal_chat",
+                    bool(getattr(agent, "_fallback_activated", False)),
+                    len(getattr(agent, "_fallback_chain", []) or []),
+                )
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -2809,18 +2819,26 @@ def run_conversation(
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)
+                _request_model = api_kwargs.get("model", "") or getattr(agent, "model", "")
                 logger.warning(
-                    "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                    "API call failed (attempt %s/%s) error_type=%s %s "
+                    "request_model=%s route_type=%s route_model=%s "
+                    "fallback_chain=%s fallback_index=%s summary=%s",
                     retry_count,
                     max_retries,
                     error_type,
                     agent._client_log_context(),
+                    _request_model,
+                    getattr(agent, "_route_type", "") or "unknown",
+                    getattr(agent, "_route_model", "") or "",
+                    bool(getattr(agent, "_fallback_chain", None)),
+                    getattr(agent, "_fallback_index", None),
                     _error_summary,
                 )
 
                 _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
-                _model = getattr(agent, "model", "unknown")
+                _model = api_kwargs.get("model", "") or getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
                 agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")

@@ -282,9 +282,23 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
+    # Preserve the configured primary runtime before init-time fallback can
+    # mutate agent.provider/agent.model.  This snapshot is the source of truth
+    # for per-turn restore after provider fallback.  Without it, a primary auth
+    # failure at startup can make the fallback provider look like the primary;
+    # routing may then send the configured primary model (e.g. gpt-5.5) through
+    # the fallback provider (e.g. OpenRouter).
+    _configured_primary_model = model
+    _configured_primary_base_url = base_url or ""
+    _configured_primary_provider = (
+        provider.strip().lower() if isinstance(provider, str) and provider.strip() else ""
+    )
+    _configured_primary_api_mode = api_mode
+    _configured_primary_api_key = api_key or ""
+    _configured_primary_client_kwargs: Dict[str, Any] = {}
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
-    provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+    provider_name = _configured_primary_provider or None
     agent.provider = provider_name or ""
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -744,6 +758,9 @@ def init_agent(
                         client_kwargs["default_headers"] = dict(_ph.default_headers)
                 except Exception:
                     pass
+            _configured_primary_api_key = api_key or ""
+            _configured_primary_base_url = str(client_kwargs.get("base_url", base_url or ""))
+            _configured_primary_client_kwargs = dict(client_kwargs)
         else:
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
@@ -765,6 +782,9 @@ def init_agent(
                     _routed_headers = getattr(_routed_client, "_default_headers", None)
                 if _routed_headers:
                     client_kwargs["default_headers"] = dict(_routed_headers)
+                _configured_primary_api_key = getattr(_routed_client, "api_key", "") or ""
+                _configured_primary_base_url = str(getattr(_routed_client, "base_url", "") or "")
+                _configured_primary_client_kwargs = dict(client_kwargs)
             else:
                 # When the user explicitly chose a non-OpenRouter provider
                 # but no credentials were found, fail fast with a clear
@@ -1682,22 +1702,33 @@ def init_agent(
     # preferred model gets a fresh attempt each time.  Uses a single dict
     # so new state fields are easy to add without N individual attributes.
     _cc = agent.context_compressor
+    _primary_model = _configured_primary_model if agent._fallback_activated else agent.model
+    _primary_provider = _configured_primary_provider if agent._fallback_activated else agent.provider
+    _primary_base_url = _configured_primary_base_url if agent._fallback_activated else agent.base_url
+    _primary_api_mode = _configured_primary_api_mode if agent._fallback_activated else agent.api_mode
+    _primary_api_key = _configured_primary_api_key if agent._fallback_activated else getattr(agent, "api_key", "")
+    _primary_client_kwargs = (
+        dict(_configured_primary_client_kwargs)
+        if agent._fallback_activated and _configured_primary_client_kwargs
+        else dict(agent._client_kwargs)
+    )
     agent._primary_runtime = {
-        "model": agent.model,
-        "provider": agent.provider,
-        "base_url": agent.base_url,
-        "api_mode": agent.api_mode,
-        "api_key": getattr(agent, "api_key", ""),
-        "client_kwargs": dict(agent._client_kwargs),
+        "model": _primary_model,
+        "provider": _primary_provider,
+        "base_url": _primary_base_url,
+        "api_mode": _primary_api_mode,
+        "api_key": _primary_api_key,
+        "client_kwargs": _primary_client_kwargs,
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).
-        "compressor_model": getattr(_cc, "model", agent.model),
-        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
-        "compressor_api_key": getattr(_cc, "api_key", ""),
-        "compressor_provider": getattr(_cc, "provider", agent.provider),
+        "compressor_model": _primary_model,
+        "compressor_base_url": _primary_base_url,
+        "compressor_api_key": _primary_api_key,
+        "compressor_provider": _primary_provider,
+        "compressor_api_mode": _primary_api_mode,
         "compressor_context_length": _cc.context_length,
         "compressor_threshold_tokens": _cc.threshold_tokens,
     }
