@@ -2085,14 +2085,23 @@ def run_conversation(
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: executed_model=%s request_model=%s response_model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: executed_model=%s request_model=%s response_model=%s provider=%s route_type=%s route_model=%s class_reason=%s ctx_tokens≈%d msgs=%d in=%d out=%d total=%d latency=%.1fs fallback_active=%s runtime_fallback=%s fallback_chain=%d%s",
                         agent.session_api_calls,
                         agent._executed_model_used or agent.model,
                         agent._request_model_used or "",
                         agent._response_model_reported or "",
                         agent.provider or "unknown",
+                        getattr(agent, "_route_type", "") or "normal_chat",
+                        getattr(agent, "_route_model", "") or "",
+                        getattr(agent, "_classification_reason", "") or "",
+                        approx_tokens,
+                        len(api_messages),
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration,
+                        bool(getattr(agent, "_fallback_activated", False)),
+                        bool(getattr(agent, "_runtime_provider_fallback_active", False)),
+                        len(getattr(agent, "_fallback_chain", []) or []),
+                        _cache_pct,
                     )
 
                     # ── Cost estimation ───────────────────────────────
@@ -2220,6 +2229,13 @@ def run_conversation(
                         fallback_to_model=getattr(agent, "_fallback_to_model", ""),
                         fallback_reason=getattr(agent, "_fallback_reason", ""),
                         attempt_number=2 if getattr(agent, "_fallback_attempted", False) else 1,
+                        route_model=getattr(agent, "_route_model", ""),
+                        context_token_estimate=approx_tokens,
+                        request_message_count=len(api_messages),
+                        fallback_chain_length=len(getattr(agent, "_fallback_chain", []) or []),
+                        fallback_chain_present=bool(getattr(agent, "_fallback_chain", []) or []),
+                        runtime_provider_fallback_active=bool(getattr(agent, "_runtime_provider_fallback_active", False)),
+                        provider_fallback_active=bool(getattr(agent, "_fallback_activated", False)),
                     )
 
                 has_retried_429 = False  # Reset on success

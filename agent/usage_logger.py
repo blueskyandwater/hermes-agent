@@ -14,6 +14,7 @@ import logging
 import os
 import time
 import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -22,20 +23,109 @@ logger = logging.getLogger(__name__)
 # Module-level state — initialised once at startup.
 _USAGE_LOG_PATH: str = ""
 _USAGE_LOG_ENABLED: bool = False
+_USAGE_LOG_MAX_BYTES: int = 20 * 1024 * 1024
+_USAGE_LOG_BACKUP_COUNT: int = 5
+_USAGE_LOGGER: Optional[logging.Logger] = None
+_USAGE_HANDLER: Optional[RotatingFileHandler] = None
+
+
+def _reset_usage_log_state() -> None:
+    """Test/helper hook to clear the dedicated usage logger state."""
+    global _USAGE_LOGGER, _USAGE_HANDLER, _USAGE_LOG_ENABLED, _USAGE_LOG_PATH
+    if _USAGE_HANDLER is not None and _USAGE_LOGGER is not None:
+        try:
+            _USAGE_LOGGER.removeHandler(_USAGE_HANDLER)
+        except Exception:
+            pass
+        try:
+            _USAGE_HANDLER.close()
+        except Exception:
+            pass
+    _USAGE_HANDLER = None
+    _USAGE_LOGGER = None
+    _USAGE_LOG_ENABLED = False
+    _USAGE_LOG_PATH = ""
+
+
+def _coerce_positive_int(value, default: int) -> int:
+    try:
+        coerced = int(value)
+        return coerced if coerced > 0 else default
+    except Exception:
+        return default
+
+
+def _emit_record(record: dict, *, source: str) -> None:
+    if not _USAGE_LOG_ENABLED or _USAGE_LOGGER is None:
+        return
+    try:
+        _USAGE_LOGGER.info(json.dumps(record, ensure_ascii=False, default=str))
+    except Exception as exc:
+        logger.debug("Failed to write usage log (%s): %s", source, exc)
 
 
 def init_usage_log(config: dict) -> None:
-    """Read the usage_log_path from config or env var.
+    """Read usage log path/rotation config from config or env var.
 
     Call once at startup (e.g. from agent_init or the CLI boot path).
     """
-    global _USAGE_LOG_PATH, _USAGE_LOG_ENABLED
+    global _USAGE_LOG_PATH, _USAGE_LOG_ENABLED, _USAGE_LOGGER
+    global _USAGE_HANDLER, _USAGE_LOG_MAX_BYTES, _USAGE_LOG_BACKUP_COUNT
+
     path = config.get("usage_log_path") or os.environ.get("HERMES_USAGE_LOG", "")
-    if path:
-        _USAGE_LOG_PATH = os.path.expanduser(path)
-        _USAGE_LOG_ENABLED = True
-        Path(_USAGE_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Usage log enabled → %s", _USAGE_LOG_PATH)
+    if not path:
+        _reset_usage_log_state()
+        return
+
+    max_size_mb = config.get("usage_log_max_size_mb")
+    if max_size_mb is None:
+        max_size_mb = os.environ.get("HERMES_USAGE_LOG_MAX_SIZE_MB")
+    backup_count = config.get("usage_log_backup_count")
+    if backup_count is None:
+        backup_count = os.environ.get("HERMES_USAGE_LOG_BACKUP_COUNT")
+
+    _USAGE_LOG_MAX_BYTES = _coerce_positive_int(max_size_mb, 20) * 1024 * 1024
+    _USAGE_LOG_BACKUP_COUNT = _coerce_positive_int(backup_count, 5)
+    _USAGE_LOG_PATH = os.path.expanduser(path)
+    Path(_USAGE_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+    logger_name = f"hermes.usage.{_USAGE_LOG_PATH}"
+    if _USAGE_HANDLER is not None and _USAGE_LOGGER is not None:
+        try:
+            _USAGE_LOGGER.removeHandler(_USAGE_HANDLER)
+        except Exception:
+            pass
+        try:
+            _USAGE_HANDLER.close()
+        except Exception:
+            pass
+
+    _USAGE_LOGGER = logging.getLogger(logger_name)
+    _USAGE_LOGGER.setLevel(logging.INFO)
+    _USAGE_LOGGER.propagate = False
+    for handler in list(_USAGE_LOGGER.handlers):
+        _USAGE_LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    _USAGE_HANDLER = RotatingFileHandler(
+        _USAGE_LOG_PATH,
+        maxBytes=_USAGE_LOG_MAX_BYTES,
+        backupCount=_USAGE_LOG_BACKUP_COUNT,
+        encoding='utf-8',
+    )
+    _USAGE_HANDLER.setLevel(logging.INFO)
+    _USAGE_HANDLER.setFormatter(logging.Formatter('%(message)s'))
+    _USAGE_LOGGER.addHandler(_USAGE_HANDLER)
+    _USAGE_LOG_ENABLED = True
+    logger.info(
+        "Usage log enabled → %s (max=%d bytes backups=%d)",
+        _USAGE_LOG_PATH,
+        _USAGE_LOG_MAX_BYTES,
+        _USAGE_LOG_BACKUP_COUNT,
+    )
 
 
 def log_bypass_call(
@@ -81,13 +171,15 @@ def log_bypass_call(
         "fallback_from_model": "",
         "fallback_to_model": "",
         "fallback_reason": "",
+        "route_model": "",
+        "context_token_estimate": 0,
+        "request_message_count": 0,
+        "fallback_chain_length": 0,
+        "fallback_chain_present": False,
+        "runtime_provider_fallback_active": False,
+        "provider_fallback_active": False,
     }
-
-    try:
-        with open(_USAGE_LOG_PATH, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception as exc:
-        logger.debug("Failed to write usage log (bypass): %s", exc)
+    _emit_record(record, source='bypass')
 
 
 def log_llm_call(
@@ -119,6 +211,14 @@ def log_llm_call(
     fallback_from_model: str = "",
     fallback_to_model: str = "",
     fallback_reason: str = "",
+    # Routing + context observability
+    route_model: str = "",
+    context_token_estimate: int = 0,
+    request_message_count: int = 0,
+    fallback_chain_length: int = 0,
+    fallback_chain_present: bool = False,
+    runtime_provider_fallback_active: bool = False,
+    provider_fallback_active: bool = False,
 ) -> None:
     """Append one structured usage record to the JSONL log file.
 
@@ -155,13 +255,15 @@ def log_llm_call(
         "fallback_from_model": fallback_from_model,
         "fallback_to_model": fallback_to_model,
         "fallback_reason": fallback_reason,
+        "route_model": route_model,
+        "context_token_estimate": context_token_estimate,
+        "request_message_count": request_message_count,
+        "fallback_chain_length": fallback_chain_length,
+        "fallback_chain_present": fallback_chain_present,
+        "runtime_provider_fallback_active": runtime_provider_fallback_active,
+        "provider_fallback_active": provider_fallback_active,
         # NOTE: "error" intentionally excluded from the core schema to
         # prevent accidental logging of user message content via error
         # messages. Add it explicitly if you need error-type analysis.
     }
-
-    try:
-        with open(_USAGE_LOG_PATH, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception as exc:
-        logger.debug("Failed to write usage log: %s", exc)
+    _emit_record(record, source='llm')

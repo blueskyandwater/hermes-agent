@@ -452,6 +452,13 @@ class TestRequestResponseExecutedModelLogging:
         assert kwargs["response_model"] == "gpt-5.5"
         assert kwargs["executed_model"] == "gpt-5.5"
 
+        assert kwargs["route_model"] == "gpt-5.3-codex-spark"
+        assert kwargs["route_type"] == "normal_chat"
+        assert kwargs["context_token_estimate"] >= 0
+        assert kwargs["request_message_count"] >= 1
+        assert kwargs["fallback_chain_present"] is False
+
+
     def test_completion_log_shows_request_and_response_models(self, caplog):
         agent = _make_agent(model="gpt-5.5", provider="openrouter", api_mode="chat_completions")
         _enable_routing(agent, route_model="gpt-5.3-codex-spark")
@@ -477,6 +484,10 @@ class TestRequestResponseExecutedModelLogging:
         assert "executed_model=gpt-5.5" in joined
         assert "request_model=gpt-5.3-codex-spark" in joined
         assert "response_model=gpt-5.5" in joined
+        assert "route_type=normal_chat" in joined
+        assert "route_model=gpt-5.3-codex-spark" in joined
+        assert "ctx_tokens≈" in joined
+        assert "fallback_chain=" in joined
 
 
 # ---------------------------------------------------------------------------

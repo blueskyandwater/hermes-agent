@@ -2424,6 +2424,9 @@ DEFAULT_CONFIG = {
     # One line per LLM API call. Disabled by default.
     # Relative paths resolve against $HERMES_HOME.
     "usage_log_path": "",
+    # Size-based rotation for usage_log_path.
+    "usage_log_max_size_mb": 20,
+    "usage_log_backup_count": 5,
 
     # Config schema version - bump this when adding new required fields.
     "_config_version": 26,
