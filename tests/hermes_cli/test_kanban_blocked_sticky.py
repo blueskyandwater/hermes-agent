@@ -277,3 +277,64 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+def test_review_required_auto_creates_review_card(kanban_home: Path) -> None:
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        tid = kb.create_task(conn, title="needs review", assignee="code-worker")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-required: verify final diff and tests",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        tasks = kb.list_tasks(conn)
+        reviews = [t for t in tasks if t.assignee == "review-worker" and t.id != tid]
+        assert len(reviews) == 1
+        assert "AUTO_REVIEW_TARGET_TASK_ID=" in (reviews[0].body or "")
+
+
+def test_auto_review_pass_completes_target_task(kanban_home: Path) -> None:
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        target = kb.create_task(conn, title="impl", assignee="code-worker")
+        kb.claim_task(conn, target)
+        kb.block_task(
+            conn, target,
+            reason="review-required: verify",
+            expected_run_id=kb.get_task(conn, target).current_run_id,
+        )
+        review = next(t for t in kb.list_tasks(conn) if t.assignee == "review-worker")
+        kb.complete_task(
+            conn,
+            review.id,
+            summary="pass: looks good",
+            metadata={"review_decision": "pass"},
+        )
+        assert kb.get_task(conn, target).status == "done"
+
+
+def test_auto_review_fail_spawns_repair_card(kanban_home: Path) -> None:
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        target = kb.create_task(conn, title="impl", assignee="code-worker")
+        kb.claim_task(conn, target)
+        kb.block_task(
+            conn, target,
+            reason="review-required: verify",
+            expected_run_id=kb.get_task(conn, target).current_run_id,
+        )
+        review = next(t for t in kb.list_tasks(conn) if t.assignee == "review-worker")
+        kb.complete_task(
+            conn,
+            review.id,
+            summary="fail: tests missing",
+            metadata={"review_decision": "fail"},
+        )
+        repair_cards = [
+            t for t in kb.list_tasks(conn)
+            if t.assignee == "code-worker" and t.id not in {target, review.id}
+        ]
+        assert len(repair_cards) == 1
+        assert repair_cards[0].status in {"ready", "todo"}

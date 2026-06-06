@@ -64,6 +64,27 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _apply_route_max_turns(agent: Any, route_max_turns: Optional[int], base_max_iterations: int) -> bool:
+    """Apply an exact route-local turn budget to the current turn.
+
+    Returns True when the active turn budget changed.  ``agent._configured_max_iterations``
+    remains the global/default budget and is restored at the start of each
+    user turn, so a surgical route cannot make later normal-chat turns run longer.
+    """
+    if not route_max_turns or route_max_turns == agent.max_iterations:
+        return False
+    agent.max_iterations = route_max_turns
+    agent._route_max_turns = route_max_turns
+    agent.iteration_budget = IterationBudget(route_max_turns)
+    logger.info(
+        "route-local turn budget applied: route=%s max_turns=%d base_max_turns=%d",
+        getattr(agent, "_route_type", "unknown"),
+        route_max_turns,
+        base_max_iterations,
+    )
+    return True
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -492,7 +513,10 @@ def run_conversation(
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     # They are initialized in __init__ and must persist across run_conversation
     # calls so that nudge logic accumulates correctly in CLI mode.
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    _base_max_iterations = int(getattr(agent, "_configured_max_iterations", agent.max_iterations))
+    agent.max_iterations = _base_max_iterations
+    agent._route_max_turns = None
+    agent.iteration_budget = IterationBudget(_base_max_iterations)
 
     # Log conversation turn start for debugging/observability
     _preview_text = _summarize_user_message_for_log(user_message)
@@ -1271,6 +1295,7 @@ def run_conversation(
                     from agent.route_classifier import (
                         classify_message,
                         get_fallback_route_model,
+                        get_route_max_turns,
                         get_route_model,
                     )
                     agent._route_type, agent._classification_reason = classify_message(
@@ -1281,6 +1306,10 @@ def run_conversation(
                     agent._route_model = get_route_model(
                         agent._route_type, agent._routing_config
                     )
+                    _route_max_turns = get_route_max_turns(
+                        agent._route_type, agent._routing_config
+                    )
+                    _apply_route_max_turns(agent, _route_max_turns, _base_max_iterations)
                 else:
                     agent._route_type = "normal_chat"
                     agent._route_model = ""

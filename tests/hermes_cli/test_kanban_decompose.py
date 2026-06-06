@@ -345,3 +345,18 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+def test_workflow_guidance_mentions_git_librarian_when_available():
+    roster = [
+        {"name": "chatgpt-worker", "description": "pm", "has_description": True},
+        {"name": "research-worker", "description": "research", "has_description": True},
+        {"name": "design-worker", "description": "design", "has_description": True},
+        {"name": "code-worker", "description": "code", "has_description": True},
+        {"name": "review-worker", "description": "review", "has_description": True},
+        {"name": "git-librarian-worker", "description": "git cleanup", "has_description": True},
+    ]
+    guidance = decomp._workflow_guidance(roster)
+    assert "git-librarian-worker" in guidance
+    assert "Complex default chain" in guidance
+    assert "Review should be a distinct stage" in guidance

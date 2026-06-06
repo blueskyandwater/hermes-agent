@@ -102,6 +102,9 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+AUTO_REVIEW_REASON_PREFIX = "review-required:"
+AUTO_REVIEW_DECISION_KEY = "review_decision"
+AUTO_REVIEW_META_PREFIX = "AUTO_REVIEW_"
 
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
@@ -2045,8 +2048,160 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     if assignee is None:
         return None
     from hermes_cli.profiles import normalize_profile_name
-
     return normalize_profile_name(assignee)
+
+
+def _profile_exists(name: Optional[str]) -> bool:
+    if not name or not str(name).strip():
+        return False
+    try:
+        from hermes_cli import profiles as profiles_mod
+        return bool(profiles_mod.profile_exists(str(name).strip()))
+    except Exception:
+        return False
+
+
+def _auto_review_metadata_lines(*, target_task_id: str, repair_assignee: str) -> str:
+    return "\n".join([
+        f"{AUTO_REVIEW_META_PREFIX}TARGET_TASK_ID={target_task_id}",
+        f"{AUTO_REVIEW_META_PREFIX}REPAIR_ASSIGNEE={repair_assignee}",
+    ])
+
+
+def _parse_auto_review_task_body(body: Optional[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith(AUTO_REVIEW_META_PREFIX) or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[key[len(AUTO_REVIEW_META_PREFIX):].strip().lower()] = value.strip()
+    return parsed
+
+
+def _infer_review_decision(summary: Optional[str], metadata: Optional[dict]) -> Optional[str]:
+    if isinstance(metadata, dict):
+        raw = metadata.get(AUTO_REVIEW_DECISION_KEY)
+        if isinstance(raw, str) and raw.strip():
+            decision = raw.strip().lower()
+            if decision in {"pass", "fail"}:
+                return decision
+    text = (summary or "").strip().lower()
+    if text.startswith("pass:") or text.startswith("approved:"):
+        return "pass"
+    if text.startswith("fail:") or text.startswith("changes-requested:"):
+        return "fail"
+    return None
+
+
+def _ensure_auto_review_followup(conn: sqlite3.Connection, task_id: str, reason: Optional[str]) -> Optional[str]:
+    if not isinstance(reason, str) or not reason.strip().lower().startswith(AUTO_REVIEW_REASON_PREFIX):
+        return None
+    review_assignee = "review-worker" if _profile_exists("review-worker") else None
+    if not review_assignee:
+        return None
+    target = get_task(conn, task_id)
+    if target is None:
+        return None
+    repair_assignee = target.assignee if target.assignee and _profile_exists(target.assignee) else None
+    if not repair_assignee and _profile_exists("code-worker"):
+        repair_assignee = "code-worker"
+    if not repair_assignee:
+        repair_assignee = review_assignee
+    review_body = (
+        _auto_review_metadata_lines(target_task_id=task_id, repair_assignee=repair_assignee)
+        + "\n\n"
+        + f"Review target task: {task_id}\n"
+        + f"Original title: {target.title}\n"
+        + f"Review request: {reason.strip()}\n\n"
+        + "Check the target task's latest run summary, comments, attachments, artifacts, and workspace output.\n"
+        + "When you finish, call kanban_complete with metadata.review_decision set to either 'pass' or 'fail'.\n"
+        + "Use 'pass' only when the target is ready to progress. Use 'fail' when code-worker follow-up is needed.\n"
+        + "Put the human-readable rationale in your completion summary.\n"
+    )
+    review_id = create_task(
+        conn,
+        title=f"review: {target.title}"[:200],
+        body=review_body,
+        assignee=review_assignee,
+        created_by=target.assignee or "auto-review",
+        tenant=target.tenant,
+        board=get_current_board(),
+        idempotency_key=f"auto-review:{task_id}",
+    )
+    add_comment(
+        conn,
+        task_id,
+        author="kanban-auto-review",
+        body=f"Auto-created review card {review_id} for {task_id}.",
+    )
+    return review_id
+
+
+def _apply_auto_review_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    review_task = get_task(conn, task_id)
+    if review_task is None:
+        return
+    parsed = _parse_auto_review_task_body(review_task.body)
+    target_task_id = parsed.get("target_task_id")
+    if not target_task_id:
+        return
+    decision = _infer_review_decision(summary, metadata)
+    if decision is None:
+        return
+    target = get_task(conn, target_task_id)
+    if target is None:
+        return
+    if decision == "pass":
+        if target.status != "done":
+            complete_task(
+                conn,
+                target_task_id,
+                summary=(
+                    f"Review approved by {task_id}. "
+                    + ((summary or "").strip() or "No additional reviewer summary provided.")
+                )[:2000],
+                metadata={"review_card": task_id, AUTO_REVIEW_DECISION_KEY: "pass"},
+            )
+            add_comment(
+                conn,
+                target_task_id,
+                author="kanban-auto-review",
+                body=f"Review card {task_id} passed. Target auto-completed.",
+            )
+        return
+    repair_assignee = parsed.get("repair_assignee") or "code-worker"
+    if not _profile_exists(repair_assignee):
+        repair_assignee = target.assignee or "code-worker"
+    repair_id = create_task(
+        conn,
+        title=f"repair: {target.title}"[:200],
+        body=(
+            f"Fix follow-up for reviewed task {target_task_id}.\n"
+            f"Review card: {task_id}\n"
+            f"Reviewer summary:\n{(summary or '').strip() or '(no summary provided)'}\n\n"
+            "Read the review card, the original task, and recent task comments before editing.\n"
+            "Address the review findings, then block again with review-required: if another review pass is needed.\n"
+        ),
+        assignee=repair_assignee,
+        created_by=review_task.assignee or "review-worker",
+        tenant=review_task.tenant,
+        board=get_current_board(),
+        parents=[task_id],
+        idempotency_key=f"auto-review-repair:{task_id}",
+    )
+    add_comment(
+        conn,
+        target_task_id,
+        author="kanban-auto-review",
+        body=f"Review card {task_id} failed. Repair card {repair_id} assigned to {repair_assignee}.",
+    )
 
 
 def create_task(
@@ -3736,6 +3891,7 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    _apply_auto_review_completion(conn, task_id, summary=summary, metadata=metadata)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
@@ -4096,7 +4252,8 @@ def block_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
-        return True
+    _ensure_auto_review_followup(conn, task_id, reason)
+    return True
 
 
 

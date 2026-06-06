@@ -817,6 +817,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "normal_chat": {},
         "code_or_debug": {},
+        "surgical_code": {"max_turns": 120},
         "summary": {},
         "long_context": {},
         "research": {},

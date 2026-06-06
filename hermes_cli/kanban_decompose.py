@@ -118,6 +118,9 @@ Available profiles (assignees you may pick from):
 {roster}
 
 Default assignee (used when no profile fits a task): {default_assignee}
+
+Preferred workflow guidance:
+{workflow_guidance}
 """
 
 
@@ -268,6 +271,52 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _workflow_guidance(roster: list[dict]) -> str:
+    names = {entry.get("name") for entry in roster if isinstance(entry, dict)}
+    if not names:
+        return (
+            "- No specialist roster is installed. Keep decomposition conservative and "
+            "route unmatched work to the default assignee."
+        )
+
+    def has(name: str) -> bool:
+        return name in names
+
+    def chain_text(parts: list[Optional[str]]) -> str:
+        chosen = [p for p in parts if p]
+        return " → ".join(chosen) if chosen else "(no matching specialist chain installed)"
+
+    complex_chain = chain_text([
+        "chatgpt-worker" if has("chatgpt-worker") else None,
+        "research-worker" if has("research-worker") else None,
+        "design-worker" if has("design-worker") else None,
+        "code-worker" if has("code-worker") else None,
+        "review-worker" if has("review-worker") else None,
+        "git-librarian-worker" if has("git-librarian-worker") else None,
+    ])
+    medium_chain = chain_text([
+        "design-worker" if has("design-worker") else None,
+        "code-worker" if has("code-worker") else None,
+        "review-worker" if has("review-worker") else None,
+        "git-librarian-worker" if has("git-librarian-worker") else None,
+    ])
+    small_chain = chain_text([
+        "code-worker" if has("code-worker") else None,
+        "review-worker" if has("review-worker") else None,
+        "git-librarian-worker" if has("git-librarian-worker") else None,
+    ])
+    return "\n".join([
+        "- For complex build / product / coding requests, prefer a staged graph instead of a single implementer card.",
+        f"  Complex default chain on this machine: {complex_chain}",
+        f"  Medium default chain on this machine: {medium_chain}",
+        f"  Small default chain on this machine: {small_chain}",
+        "- `git-librarian-worker` is the final Git hygiene / packaging stage: diff review, branch cleanup, commit crafting, PR body drafting, artifact inventory, and final polish.",
+        "- If one of those specialist profiles is missing, collapse that stage rather than inventing a new assignee name.",
+        "- Review should be a distinct stage from implementation whenever code changes are involved.",
+        "- Prefer true dependency edges only: independent research/design lanes should run in parallel.",
+    ])
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -321,6 +370,7 @@ def decompose_task(
         body=_truncate(task.body or "(no body)", 4000),
         roster=_format_roster(roster),
         default_assignee=default_assignee,
+        workflow_guidance=_workflow_guidance(roster),
     )
 
     try:

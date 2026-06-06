@@ -14,6 +14,7 @@ from agent.route_classifier import (
     classify_message,
     classify_message_legacy,
     get_fallback_route_model,
+    get_route_max_turns,
     get_route_model,
     get_route_type_strings,
 )
@@ -672,6 +673,28 @@ class TestEdgeCases:
 # =========================================================================
 
 
+class TestSurgicalCodeRoute:
+    def test_explicit_surgical_code_route(self):
+        route, rsn = classify_message("surgical_code: apply the minimal safe diff")
+        assert route == "surgical_code"
+        assert rsn == "keyword:surgical_code"
+
+    def test_surgical_route_uses_exact_route_turn_budget(self):
+        config = {
+            "code_or_debug": {"model": "parent-model", "max_turns": 99},
+            "surgical_code": {"max_turns": 120},
+        }
+        assert get_route_max_turns("surgical_code", config) == 120
+
+    def test_other_routes_do_not_inherit_surgical_turn_budget(self):
+        config = {
+            "code_or_debug": {"model": "parent-model", "max_turns": 99},
+            "surgical_code": {"max_turns": 120},
+        }
+        assert get_route_max_turns("code_light", config) is None
+        assert get_route_max_turns("normal_chat", config) is None
+
+
 class TestCodeLightContextGuard:
     def test_short_context_keeps_code_light(self):
         route, rsn = classify_message(
@@ -722,6 +745,7 @@ class TestGetRouteModel:
         assert get_route_model("large_implementation", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_design", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_debug", config) == "deepseek/deepseek-v4-flash"
+        assert get_route_model("surgical_code", config) == "deepseek/deepseek-v4-flash"
         assert get_route_model("code_light", config) == "deepseek/deepseek-v4-flash"
 
     def test_large_implementation_can_have_dedicated_model(self):
@@ -778,6 +802,6 @@ class TestGetRouteTypeStrings:
         routes = get_route_type_strings()
         required = {"simple_command", "normal_chat", "vision",
                      "code_implementation", "large_implementation",
-                     "code_design", "code_debug", "code_light", "code_or_debug",
+                     "code_design", "code_debug", "surgical_code", "code_light", "code_or_debug",
                      "summary", "research", "long_context"}
         assert required.issubset(set(routes))

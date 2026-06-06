@@ -15,14 +15,15 @@ Routes (priority order — first match wins)
                             OR implementation intent + complexity heuristics)
 5.  code_implementation    Feature implementation, testing, patching
 6.  code_debug             Traceback, stack trace, error analysis, log investigation
-7.  code_light             Simple import/install issues, command checks, usage queries
-8.  code_or_debug          (catch-all) Remaining code, debug, generic tech triggers
-9.  summary                Summarisation, TL;DR, meeting notes
-10. research               Research-heavy, deep investigation
-11. long_context           Long document analysis (>2000 chars or explicit)
-12. complex_task           ``estimate_complexity() >= 4`` — complex prompts that
+7.  surgical_code          Small, precise code edits that need a few extra turns
+8.  code_light             Simple import/install issues, command checks, usage queries
+9.  code_or_debug          (catch-all) Remaining code, debug, generic tech triggers
+10. summary                Summarisation, TL;DR, meeting notes
+11. research               Research-heavy, deep investigation
+12. long_context           Long document analysis (>2000 chars or explicit)
+13. complex_task           ``estimate_complexity() >= 4`` — complex prompts that
                             no keyword matched (e.g. multi-step, high tech density)
-13. normal_chat            DEFAULT — everyday conversation, casual Q&A
+14. normal_chat            DEFAULT — everyday conversation, casual Q&A
 
 Future routes (classified but not yet associated with a model)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -220,6 +221,17 @@ _CODE_LIGHT_CONTEXT_TRIGGERS = (
     "pip", "uv", "npm", "pnpm", "yarn", "git", "jq", "sed", "awk",
     "コマンド", "関数", "クラス", "メソッド", "構文", "正規表現",
     "辞書", "配列", "リスト", "インポート", "パッケージ",
+)
+
+# ── surgical_code ──────────────────────────────────────────────────────
+# Explicit small/surgical coding asks.  Kept separate from code_light so it can
+# use a route-local turn budget without letting casual chat run longer.
+_SURGICAL_CODE_TRIGGERS = (
+    "surgical_code", "surgical code", "surgical fix", "surgical patch",
+    "surgical change", "precise fix", "targeted fix", "small safe diff",
+    "small safe change", "minimal safe diff", "minimal safe change",
+    "小さく安全", "小さい安全", "最小安全", "ピンポイント修正",
+    "局所修正", "局所的な修正", "最小差分", "必要最小限の差分",
 )
 
 # ── summary ──────────────────────────────────────────────────────────
@@ -465,7 +477,12 @@ def classify_message(
         if trigger in _lower:
             return "code_debug", "keyword:code_debug"
 
-    # 7. code_light — lightweight code/import/install/usage issues
+    # 7. surgical_code — explicit small/surgical code edits
+    for trigger in _SURGICAL_CODE_TRIGGERS:
+        if trigger in _lower:
+            return "surgical_code", "keyword:surgical_code"
+
+    # 8. code_light — lightweight code/import/install/usage issues
     # Keep this route truly lightweight.  Some small/fast coding models work
     # for direct one-off command/import questions but reject or degrade on a
     # large accumulated conversation context.  In that case route by context
@@ -535,6 +552,7 @@ _ROUTE_MODEL_ALIASES = {
     "code_implementation": "code_or_debug",
     "code_design": "code_or_debug",
     "code_debug": "code_or_debug",
+    "surgical_code": "code_or_debug",
     "code_light": "code_or_debug",
 }
 
@@ -567,6 +585,38 @@ def get_route_model(
             if model:
                 return model
     return routing_config.get("fallback", "")
+
+
+def get_route_max_turns(
+    route_type: str,
+    routing_config: dict,
+) -> Optional[int]:
+    """Return a route-local turn budget for *route_type*, if configured.
+
+    The value is intentionally exact-route only: sub-routes can inherit model
+    choices through ``_ROUTE_MODEL_ALIASES``, but turn budgets should not bleed
+    from a broad parent such as ``code_or_debug`` into every lightweight code
+    route.  Invalid, missing, zero, or negative values are ignored.
+    """
+    if not isinstance(routing_config, dict):
+        return None
+    route_cfg = routing_config.get(route_type, {})
+    if not isinstance(route_cfg, dict):
+        return None
+    raw = route_cfg.get("max_turns")
+    if raw is None:
+        # ``max_iterations`` is accepted as a readable alias for callers that
+        # think in agent-loop terms, but config docs should prefer max_turns.
+        raw = route_cfg.get("max_iterations")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 def _route_model_from_mapping(route_type: str, route_map: dict) -> str:
@@ -648,6 +698,7 @@ def get_route_type_strings() -> tuple[str, ...]:
         "code_implementation",
         "code_design",
         "code_debug",
+        "surgical_code",
         "code_light",
         "code_or_debug",
         "summary",
