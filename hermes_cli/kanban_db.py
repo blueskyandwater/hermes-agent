@@ -4255,6 +4255,62 @@ def block_task(
     _ensure_auto_review_followup(conn, task_id, reason)
     return True
 
+def _reconcile_blocked_review_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Blocked-task watchdog: scan blocked tasks whose most recent
+    ``blocked`` event carries a ``review-required:`` reason and re-create
+    any missing review card.
+
+    The normal path is ``block_task(..., reason="review-required:...")`` ->
+    ``_ensure_auto_review_followup``, which creates a review card
+    *outside* the write txn so a crash between the status flip and the
+    followup call leaves a blocked task with no review card. This
+    function heals that class of orphan on the next dispatcher tick.
+
+    Idempotent via ``create_task(..., idempotency_key="auto-review:<task_id>")``
+    -- safe to call every tick.
+
+    Returns the list of task ids for which a missing review card was
+    created.
+    """
+    blocked = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    healed: list[str] = []
+    for row in blocked:
+        tid = row["id"]
+        # Look up the most recent blocked event.
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        if ev is None:
+            continue
+        try:
+            payload = json.loads(ev["payload"]) if ev["payload"] else None
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip().lower().startswith(AUTO_REVIEW_REASON_PREFIX):
+            continue
+        # Skip if review card already exists (by idempotency key).
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived'",
+            (f"auto-review:{tid}",),
+        ).fetchone()
+        if existing is not None:
+            continue
+        created = _ensure_auto_review_followup(conn, tid, reason)
+        if created is not None:
+            healed.append(tid)
+    return healed
+
+
+
 
 
 def promote_task(
@@ -5004,6 +5060,14 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    blocked_watchdog_healed: list[str] = field(default_factory=list)
+    """Task ids for which a missing review card was re-created by the
+    blocked-task watchdog after the original ``block_task(…, reason=
+    "review-required:…")`` call lost its followup (crash, race, missed
+    hook). Each tick scans blocked tasks whose most recent ``blocked``
+    event carries a ``review-required:`` reason, and calls
+    ``_ensure_auto_review_followup`` if no review card (matched by
+    idempotency key) exists yet. Idempotent — safe to call repeatedly."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6501,6 +6565,11 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- blocked-task watchdog: heal orphan review cards ----
+    blocked_healed = _reconcile_blocked_review_tasks(conn)
+    if blocked_healed:
+        result.blocked_watchdog_healed = blocked_healed
     return result
 
 

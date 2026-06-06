@@ -10,12 +10,12 @@ Routes (priority order — first match wins)
 -------------------------------------------
 1.  simple_command         Leading ``/`` + word (Hermes slash command)
 2.  vision                 Image content detected in the message
-3.  code_design            Architecture, design, planning, PR split
-4.  large_implementation   Large feature implementation (explicit size keywords
+3.  surgical_code          Small, precise code edits that need a few extra turns
+4.  code_design            Architecture, design, planning, PR split
+5.  large_implementation   Large feature implementation (explicit size keywords
                             OR implementation intent + complexity heuristics)
-5.  code_implementation    Feature implementation, testing, patching
-6.  code_debug             Traceback, stack trace, error analysis, log investigation
-7.  surgical_code          Small, precise code edits that need a few extra turns
+6.  code_implementation    Feature implementation, testing, patching
+7.  code_debug             Traceback, stack trace, error analysis, log investigation
 8.  code_light             Simple import/install issues, command checks, usage queries
 9.  code_or_debug          (catch-all) Remaining code, debug, generic tech triggers
 10. summary                Summarisation, TL;DR, meeting notes
@@ -455,32 +455,34 @@ def classify_message(
     if history and _has_image_content(history):
         return "vision", "image_in_message"
 
-    # 3. code_design — architecture, planning, PR split
+    # 3. surgical_code — explicit small/surgical code edits
+    # Check explicit surgical markers before broader implementation/debug verbs
+    # so the thin-context Spark path and route-local turn budget are preserved.
+    for trigger in _SURGICAL_CODE_TRIGGERS:
+        if trigger in _lower:
+            return "surgical_code", "keyword:surgical_code"
+
+    # 4. code_design — architecture, planning, PR split
     # Design triggers are checked before implementation because phrases like
     # 「PR分割案を作って」 contain generic implementation verbs such as 作って.
     for trigger in _CODE_DESIGN_TRIGGERS:
         if trigger in _lower:
             return "code_design", "keyword:code_design"
 
-    # 4. large_implementation — explicit size keywords OR combined heuristics
+    # 5. large_implementation — explicit size keywords OR combined heuristics
     is_large_impl, large_impl_reason = _is_large_implementation(text, _lower)
     if is_large_impl:
         return "large_implementation", large_impl_reason
 
-    # 5. code_implementation — specific asks to write code
+    # 6. code_implementation — specific asks to write code
     for trigger in _CODE_IMPL_TRIGGERS:
         if trigger in _lower:
             return "code_implementation", "keyword:code_implementation"
 
-    # 6. code_debug — traceback, log analysis, investigation
+    # 7. code_debug — traceback, log analysis, investigation
     for trigger in _CODE_DEBUG_TRIGGERS:
         if trigger in _lower:
             return "code_debug", "keyword:code_debug"
-
-    # 7. surgical_code — explicit small/surgical code edits
-    for trigger in _SURGICAL_CODE_TRIGGERS:
-        if trigger in _lower:
-            return "surgical_code", "keyword:surgical_code"
 
     # 8. code_light — lightweight code/import/install/usage issues
     # Keep this route truly lightweight.  Some small/fast coding models work

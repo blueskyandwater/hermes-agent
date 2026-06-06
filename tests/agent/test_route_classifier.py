@@ -674,8 +674,13 @@ class TestEdgeCases:
 
 
 class TestSurgicalCodeRoute:
-    def test_explicit_surgical_code_route(self):
-        route, rsn = classify_message("surgical_code: apply the minimal safe diff")
+    @pytest.mark.parametrize("text", [
+        "surgical_code: update tests",
+        "surgical_code: apply patch",
+        "surgical fix: modify the code",
+    ])
+    def test_explicit_surgical_code_route_takes_priority_over_code_verbs(self, text):
+        route, rsn = classify_message(text)
         assert route == "surgical_code"
         assert rsn == "keyword:surgical_code"
 

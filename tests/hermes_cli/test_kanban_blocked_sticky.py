@@ -338,3 +338,108 @@ def test_auto_review_fail_spawns_repair_card(kanban_home: Path) -> None:
         ]
         assert len(repair_cards) == 1
         assert repair_cards[0].status in {"ready", "todo"}
+
+
+# ---------------------------------------------------------------------------
+# Blocked-task watchdog: _reconcile_blocked_review_tasks heals orphan review
+# cards when block_task()'s followup was lost (crash between status flip
+# and _ensure_auto_review_followup).
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_heals_orphan_blocked_review_card(kanban_home: Path) -> None:
+    """A blocked task whose review card was never created (simulating a
+    crash after block_task() flipped the status but before
+    _ensure_auto_review_followup) gets its review card re-created by
+    _reconcile_blocked_review_tasks on the next dispatch tick."""
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        tid = kb.create_task(conn, title="watchdog target", assignee="code-worker")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-required: verify watchdog",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Review card should have been created by block_task followup.
+        tasks = kb.list_tasks(conn)
+        reviews = [t for t in tasks if t.assignee == "review-worker" and t.id != tid]
+        assert len(reviews) == 1, "review card must exist after normal block_task"
+
+        # Now simulate the orphan: delete the review card (and its events/comments)
+        review_id = reviews[0].id
+        conn.execute("DELETE FROM task_events WHERE task_id = ?", (review_id,))
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (review_id,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (review_id,))
+        conn.execute("DELETE FROM tasks WHERE id = ?", (review_id,))
+        conn.commit()
+        # Confirm it's gone.
+        assert kb.get_task(conn, review_id) is None
+        tasks = kb.list_tasks(conn)
+        reviews = [t for t in tasks if t.assignee == "review-worker"]
+        assert len(reviews) == 0, "review card should be gone after deletion"
+
+        # Watchdog heals.
+        healed = kb._reconcile_blocked_review_tasks(conn)
+        assert len(healed) == 1
+        assert healed[0] == tid
+
+        # Review card re-created.
+        tasks = kb.list_tasks(conn)
+        reviews = [t for t in tasks if t.assignee == "review-worker"]
+        assert len(reviews) == 1
+        new_review = reviews[0]
+        assert "AUTO_REVIEW_TARGET_TASK_ID=" in (new_review.body or "")
+        assert new_review.status == "ready"
+
+        # Second call is idempotent.
+        healed2 = kb._reconcile_blocked_review_tasks(conn)
+        assert len(healed2) == 0, "watchdog must be idempotent"
+
+
+def test_watchdog_skips_non_review_blocked_tasks(kanban_home: Path) -> None:
+    """Tasks blocked with a plain reason (not review-required:) are
+    ignored by the watchdog."""
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        tid = kb.create_task(conn, title="non-review block")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="waiting on upstream dependency",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        healed = kb._reconcile_blocked_review_tasks(conn)
+        assert len(healed) == 0, "non-review block must not trigger watchdog"
+
+
+def test_watchdog_in_dispatch_once_result(kanban_home: Path) -> None:
+    """dispatch_once populates blocked_watchdog_healed when healing occurs."""
+    with kb.connect() as conn, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"review-worker", "code-worker"})
+        tid = kb.create_task(conn, title="dispatch watchdog", assignee="code-worker")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-required: verify dispatch path",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+
+        # Orphan the review card.
+        tasks = kb.list_tasks(conn)
+        review = next(t for t in tasks if t.assignee == "review-worker")
+        conn.execute("DELETE FROM task_events WHERE task_id = ?", (review.id,))
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (review.id,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (review.id,))
+        conn.execute("DELETE FROM tasks WHERE id = ?", (review.id,))
+        conn.commit()
+
+        # dispatch_once with no ready tasks to spawn.
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert tid in result.blocked_watchdog_healed, f"expected {tid} in {result.blocked_watchdog_healed}"
+        # Confirm the review card was actually re-created.
+        tasks = kb.list_tasks(conn)
+        reviews = [t for t in tasks if t.assignee == "review-worker"]
+        assert len(reviews) == 1
