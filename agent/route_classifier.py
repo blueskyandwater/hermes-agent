@@ -69,30 +69,48 @@ _CODE_TRIGGERS = (
     "add ", "fix ", "debug", "compile", "function", "class ", "import ",
     "def ", "const ", "let ", "var ", "function ", "async ", "await ",
     "```", "print(", "console.log",
+    "patch", "diff", "repository", "repo", "source file",
+    "module", "method", "variable", "dependency", "package",
+    # Japanese generic coding terms — intentionally broad catch-all only.
+    "パッチ", "差分", "リポジトリ", "ソース",
+    "関数", "クラス", "メソッド", "変数", "依存関係", "パッケージ",
     # Error / log analysis
     "error", "traceback", "exception", "failed", "crash", "segfault",
     "trace", "log", "stderr", "stdout", "exit code", "non-zero",
+    "failure", "broken", "not working", "doesn't work", "does not work",
     # System / architecture
     "architecture", "design ", "api ", "endpoint", "database", "schema",
     "migration", "deploy", "config", "pipeline", "workflow",
     "docker", "container", "kubernetes", "k8s", "ci/cd",
+    "systemd", "service", "daemon", "server", "client", "backend", "frontend",
     # Shell / terminal
-    "bash", "shell", "command", "terminal", "script",
+    "bash", "shell", "command", "terminal", "script", "cli", "curl",
     # Testing
     "test ", "pytest", "unittest", "mock", "assert",
     # Debugging related
     "なぜ", "原因", "エラー", "直し", "バグ", "デバッグ",
+    "失敗", "落ちる", "動かない", "壊れ", "例外",
 )
 
 # ── code_implementation ────────────────────────────────────────────────
 # Feature implementation, testing, patching — specific asks to write code.
 _CODE_IMPL_TRIGGERS = (
+    # English implementation prompts — common in Hermes-generated/internal tasks.
+    "implement ", "implement the", "write code", "write a function",
+    "write the function", "create patch", "create a patch", "apply patch",
+    "apply the patch", "modify the code", "update the code", "edit the code",
+    "change the code", "add tests", "add a test", "write tests", "write a test",
+    "add pytest", "update tests", "fix the implementation",
+    "add database", "add api", "add migration", "add schema",
+    "make the change", "make the requested change",
+    # Japanese implementation prompts.
     "実装して", "コードを書い", "作って", "書いて",
     "パッチを作", "パッチを書", "パッチして",
+    "修正して", "変更して", "更新して", "編集して",
     "テスト追加", "テストを追加", "テストを書",
     "pytestを追加", "diffを確認",
     "機能を作", "機能を追加", "機能実装", "機能追加",
-    "関数を作", "クラスを作", "メソッドを書",
+    "関数を作", "関数を書", "クラスを作", "メソッドを書",
 )
 
 # ── large_implementation ───────────────────────────────────────────────
@@ -103,6 +121,9 @@ _CODE_IMPL_TRIGGERS = (
 _LARGE_IMPL_SIZE_TRIGGERS = (
     "大規模", "大きめ", "本格的", "複数ファイル", "複数箇所",
     "またがる", "全体", "一式", "エンドツーエンド", "end-to-end", "e2e",
+    "large", "substantial", "full implementation", "complete implementation",
+    "complete feature", "multi-file", "multiple files", "across files",
+    "whole feature", "entire feature", "end to end",
 )
 
 _LARGE_IMPL_SCOPE_TRIGGERS = (
@@ -110,16 +131,26 @@ _LARGE_IMPL_SCOPE_TRIGGERS = (
     "dbスキーマ", "データベース", "apiエンドポイント", "api endpoint",
     "endpoint", "migration", "マイグレーション", "schema", "database",
     "crud", "権限", "認証", "監査ログ",
+    "new feature", "feature addition", "auth feature", "authentication feature",
+    "user management", "admin feature", "admin panel", "database schema",
+    "api route", "api routes", "api endpoint", "api endpoints",
+    "authorization", "permission", "permissions", "audit log", "audit logs",
 )
 
 # ── code_design ────────────────────────────────────────────────────────
 # Architecture, design, planning, PR split — structural decisions.
 _CODE_DESIGN_TRIGGERS = (
+    # English — common in agent-generated planning/review prompts.
+    "implementation plan", "implementation strategy", "design plan",
+    "architecture review", "review the architecture", "system design",
+    "design review", "technical design", "split into prs", "split into pr",
+    "pr split", "pr plan", "impact analysis", "rollback plan",
+    "refactoring plan", "migration plan", "review the design",
     # Japanese — user specified
     "pr分割", "実装計画",
     "設計方針", "方針レビュー",
     "アーキテクチャを見直し", "アーキテクチャ設計",
-    "影響範囲", "rollback",
+    "影響範囲", "影響分析", "rollback", "ロールバック",
     "リファクタリング設計", "設計見直し",
 )
 
@@ -127,16 +158,21 @@ _CODE_DESIGN_TRIGGERS = (
 # Traceback, stack trace, error analysis, log investigation.
 _CODE_DEBUG_TRIGGERS = (
     # Stack traces
-    "traceback", "stack trace",
+    "traceback", "stack trace", "stacktrace",
     # Log analysis
-    "gateway.log", "error log",
+    "gateway.log", "error log", "logs show", "log shows", "inspect the logs",
     "ログ解析", "エラー解析", "例外解析",
     # Investigation
-    "原因調査", "原因を調べ", "原因を特定", "原因を調査",
+    "root cause", "find the cause", "identify the cause", "investigate why",
+    "debug why", "why is this failing", "why it fails", "why it failed",
+    "原因調査", "原因を調べ", "原因を特定", "原因を調査", "失敗原因",
     # Why analysis
-    "なぜ動かない",
+    "why doesn't", "why does not", "not working", "doesn't work", "does not work",
+    "なぜ動かない", "なぜ失敗", "なぜ落ち", "動かない原因",
     # Specific errors
-    "segfault",
+    "segfault", "test failure", "failing test", "pytest failed", "build failed",
+    "ci failed", "ci failure", "test failed", "tests failed",
+    "テスト失敗", "テストが失敗", "pytestが失敗", "ビルド失敗", "ci失敗",
     "exit code", "non-zero",
 )
 
@@ -145,15 +181,45 @@ _CODE_DEBUG_TRIGGERS = (
 _CODE_LIGHT_TRIGGERS = (
     # Import issues
     "modulenotfound", "module not found",
-    "import error", "importできない",
+    "import error", "import failed", "cannot import", "no module named",
+    "importできない", "インポートできない",
     # Package install
-    "pip install", "インストール",
-    "入れない", "入らない",
+    "pip install", "npm install", "pnpm install", "uv add", "apt install",
+    "インストール",
+    "入れない", "入らない", "入れ方", "導入方法",
     # Command check
-    "command not found",
+    "command not found", "is this command correct", "check this command",
+    "which command", "what command", "command only", "just the command",
     "このコマンド",
-    # Simple usage
-    "使い方", "書き方",
+    "コマンド確認", "コマンドだけ", "どのコマンド", "実行コマンド",
+    # Simple code usage/examples. Avoid generic brevity words like "短く" here;
+    # they must not route ordinary chat to Spark.
+    "syntax", "minimal example", "small example", "simple example",
+    "example command", "python syntax", "sort a dict", "sort dict",
+    "構文", "一行", "1行", "例だけ", "最小例",
+    # Small/surgical fixes that are safe for lightweight code models.
+    "small fix", "tiny fix", "minimal fix", "one-function", "one function",
+    "single function", "single-line fix", "one-line fix",
+    "軽い修正", "小さい修正", "最小修正", "この関数だけ", "一箇所", "1箇所",
+)
+
+# Generic brevity/usage phrasing should only become code_light when the same
+# message also contains a coding/shell context word.  Otherwise casual prompts
+# such as 「短く返事して」 would incorrectly route to Spark.
+_CODE_LIGHT_SOFT_TRIGGERS = (
+    "how do i", "how to", "usage", "quick answer", "short answer",
+    "one-line", "one line", "1-line", "1 line", "一行で", "1行で",
+    "使い方", "書き方", "どう書く", "どうやる", "短く",
+    "example", "sample", "snippet", "code example", "code snippet",
+)
+
+_CODE_LIGHT_CONTEXT_TRIGGERS = (
+    "python", "javascript", "typescript", "js", "ts", "sql", "regex",
+    "json", "yaml", "dict", "list", "array", "function", "class",
+    "import", "module", "package", "command", "bash", "shell", "curl",
+    "pip", "uv", "npm", "pnpm", "yarn", "git", "jq", "sed", "awk",
+    "コマンド", "関数", "クラス", "メソッド", "構文", "正規表現",
+    "辞書", "配列", "リスト", "インポート", "パッケージ",
 )
 
 # ── summary ──────────────────────────────────────────────────────────
@@ -399,24 +465,33 @@ def classify_message(
         if trigger in _lower:
             return "code_debug", "keyword:code_debug"
 
-    # 7. code_light — simple import/install/usage issues
+    # 7. code_light — lightweight code/import/install/usage issues
     # Keep this route truly lightweight.  Some small/fast coding models work
     # for direct one-off command/import questions but reject or degrade on a
     # large accumulated conversation context.  In that case route by context
     # size instead of the local keyword so config can send it to a long-context
     # capable model.
-    _CODE_LIGHT_MAX_CONTEXT_TOKENS = 6_000
+    _CODE_LIGHT_MAX_CONTEXT_TOKENS = 12_000
+
+    def _return_code_light() -> tuple[str, str]:
+        if (
+            context_token_estimate is not None
+            and context_token_estimate > _CODE_LIGHT_MAX_CONTEXT_TOKENS
+        ):
+            return (
+                "long_context",
+                f"context_tokens>{_CODE_LIGHT_MAX_CONTEXT_TOKENS}:code_light_guard",
+            )
+        return "code_light", "keyword:code_light"
+
     for trigger in _CODE_LIGHT_TRIGGERS:
         if trigger in _lower:
-            if (
-                context_token_estimate is not None
-                and context_token_estimate > _CODE_LIGHT_MAX_CONTEXT_TOKENS
-            ):
-                return (
-                    "long_context",
-                    f"context_tokens>{_CODE_LIGHT_MAX_CONTEXT_TOKENS}:code_light_guard",
-                )
-            return "code_light", "keyword:code_light"
+            return _return_code_light()
+
+    if any(trigger in _lower for trigger in _CODE_LIGHT_SOFT_TRIGGERS) and any(
+        context in _lower for context in _CODE_LIGHT_CONTEXT_TRIGGERS
+    ):
+        return _return_code_light()
 
     # 8. code_or_debug — generic code triggers (catch-all)
     for trigger in _CODE_TRIGGERS:

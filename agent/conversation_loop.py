@@ -1328,6 +1328,21 @@ def run_conversation(
                         )
                         if _fallback_route_model:
                             api_kwargs["model"] = _fallback_route_model
+                        else:
+                            # Safety net: this route_type has no entry in
+                            # routing.fallback_routes.  Keep agent.model
+                            # (already set by _build_api_kwargs, which should
+                            # reflect the fallback provider's default model
+                            # after try_activate_fallback()) instead of
+                            # allowing agent._route_model (primary provider
+                            # model) to leak through.
+                            if getattr(agent, "_runtime_provider_fallback_active", False):
+                                logger.warning(
+                                    "No fallback_route for route_type=%s in "
+                                    "runtime-provider-fallback state; keeping "
+                                    "agent.model=%s",
+                                    agent._route_type, agent.model,
+                                )
                     else:
                         api_kwargs["model"] = agent._route_model
 
