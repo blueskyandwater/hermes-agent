@@ -419,6 +419,66 @@ class TestCostEstimationConsistency:
         agent._actual_model_used == "claude/claude-sonnet-4-20250514"
 
 
+class TestRequestResponseExecutedModelLogging:
+    """Request / response / executed model tracking stays explicit."""
+
+    def test_response_model_wins_for_executed_model_and_usage_log(self, monkeypatch):
+        agent = _make_agent(model="gpt-5.5", provider="openrouter", api_mode="chat_completions")
+        _enable_routing(agent, route_model="gpt-5.3-codex-spark")
+        resp = _mock_response(
+            content="ok",
+            model="gpt-5.5",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.usage_logger.log_llm_call") as mock_usage_log,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert agent._request_model_used == "gpt-5.3-codex-spark"
+        assert agent._response_model_reported == "gpt-5.5"
+        assert agent._executed_model_used == "gpt-5.5"
+        assert agent._actual_model_used == "gpt-5.3-codex-spark"
+
+        kwargs = mock_usage_log.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.5"
+        assert kwargs["request_model"] == "gpt-5.3-codex-spark"
+        assert kwargs["response_model"] == "gpt-5.5"
+        assert kwargs["executed_model"] == "gpt-5.5"
+
+    def test_completion_log_shows_request_and_response_models(self, caplog):
+        agent = _make_agent(model="gpt-5.5", provider="openrouter", api_mode="chat_completions")
+        _enable_routing(agent, route_model="gpt-5.3-codex-spark")
+        resp = _mock_response(
+            content="ok",
+            model="gpt-5.5",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        caplog.set_level(logging.INFO)
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        messages = [r.message for r in caplog.records if "API call #1:" in r.message]
+        assert messages
+        joined = "\n".join(messages)
+        assert "executed_model=gpt-5.5" in joined
+        assert "request_model=gpt-5.3-codex-spark" in joined
+        assert "response_model=gpt-5.5" in joined
+
+
 # ---------------------------------------------------------------------------
 # no routing, no fallback — model is unchanged
 # ---------------------------------------------------------------------------

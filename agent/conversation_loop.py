@@ -422,6 +422,9 @@ def run_conversation(
     agent._fallback_from_model = ""
     agent._fallback_to_model = ""
     agent._fallback_reason = ""
+    agent._request_model_used = agent.model
+    agent._response_model_reported = ""
+    agent._executed_model_used = agent.model
 
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
@@ -1412,9 +1415,12 @@ def run_conversation(
                 # after all routing, fallback, and provider overrides.
                 # Used for cost estimation, usage.log, and session DB.
                 agent._actual_model_used = api_kwargs.get("model", "") or agent.model
+                agent._request_model_used = agent._actual_model_used
+                agent._response_model_reported = ""
+                agent._executed_model_used = agent._request_model_used or agent.model
                 logger.info(
-                    "API call: model=%s provider=%s route_type=%s fallback_active=%s fallback_chain=%d",
-                    agent._actual_model_used,
+                    "API call: request_model=%s provider=%s route_type=%s fallback_active=%s fallback_chain=%d",
+                    agent._request_model_used,
                     getattr(agent, "provider", ""),
                     getattr(agent, "_route_type", "") or "normal_chat",
                     bool(getattr(agent, "_fallback_activated", False) or getattr(agent, "_runtime_provider_fallback_active", False)),
@@ -1764,6 +1770,18 @@ def run_conversation(
                         )
                         finish_reason = "length"
 
+                _response_model = getattr(response, "model", None)
+                if isinstance(_response_model, str) and _response_model.strip():
+                    agent._response_model_reported = _response_model.strip()
+                else:
+                    agent._response_model_reported = ""
+                agent._executed_model_used = (
+                    agent._response_model_reported
+                    or agent._request_model_used
+                    or agent._actual_model_used
+                    or agent.model
+                )
+
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
@@ -2067,8 +2085,12 @@ def run_conversation(
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
-                        agent.session_api_calls, agent.model, agent.provider or "unknown",
+                        "API call #%d: executed_model=%s request_model=%s response_model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        agent.session_api_calls,
+                        agent._executed_model_used or agent.model,
+                        agent._request_model_used or "",
+                        agent._response_model_reported or "",
+                        agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )
@@ -2078,7 +2100,11 @@ def run_conversation(
                     # This is set right before the API call after all
                     # routing, fallback, and provider overrides have been
                     # applied to api_kwargs["model"].
-                    _call_model = agent._actual_model_used or agent.model
+                    _call_model = (
+                        agent._executed_model_used
+                        or agent._actual_model_used
+                        or agent.model
+                    )
                     cost_result = estimate_usage_cost(
                         _call_model,
                         canonical_usage,
@@ -2167,6 +2193,9 @@ def run_conversation(
                     _logged_model = _call_model
                     log_llm_call(
                         model=_logged_model,
+                        request_model=getattr(agent, "_request_model_used", ""),
+                        response_model=getattr(agent, "_response_model_reported", ""),
+                        executed_model=_logged_model,
                         provider=agent.provider or "unknown",
                         input_tokens=canonical_usage.input_tokens,
                         output_tokens=canonical_usage.output_tokens,
@@ -3583,6 +3612,9 @@ def run_conversation(
                                             from agent.usage_logger import log_llm_call as _log_fallback
                                             _log_fallback(
                                                 model=_current_model,
+                                                request_model=_current_model,
+                                                response_model="",
+                                                executed_model=_current_model,
                                                 provider=getattr(agent, "provider", "unknown"),
                                                 input_tokens=0,
                                                 output_tokens=0,

@@ -1094,7 +1094,10 @@ def init_agent(
     agent._route_type = "normal_chat"          # default until classified
     agent._route_model = ""                     # resolved per-turn model
     agent._classification_reason = ""            # why this route was chosen (PR6)
-    agent._actual_model_used = agent.model       # Single Source of Truth: model actually sent to API
+    agent._actual_model_used = agent.model       # Back-compat: model actually sent to API
+    agent._request_model_used = agent.model      # Request payload model sent to provider
+    agent._response_model_reported = ""         # response.model reported by provider, if any
+    agent._executed_model_used = agent.model     # Best-known model that actually ran
 
     # ── Context trimming config (PR3) ────────────────────────────────
     # Limits the number of history messages sent to the LLM per turn.
