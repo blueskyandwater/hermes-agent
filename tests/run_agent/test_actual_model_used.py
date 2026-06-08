@@ -226,14 +226,17 @@ class TestModelLevelFallback:
                     "claude/claude-sonnet-4-20250514": {
                         "fallback": "deepseek/deepseek-chat-v4-flash"
                     }
-                }
+                },
+                "self_escalation": {"enabled": True},
             }
         })
         agent._fallback_attempted = False
 
         # First call fails (transient), second succeeds with fallback model
-        fail_resp = None  # will cause ConnectionError
-        success_resp = _mock_response(content="Fallback worked", model="deepseek/deepseek-chat-v4-flash")
+        success_resp = _mock_response(
+            content="Fallback worked",
+            model="deepseek/deepseek-chat-v4-flash",
+        )
 
         # Make the client fail once then succeed
         agent.client.chat.completions.create = MagicMock(
@@ -245,19 +248,74 @@ class TestModelLevelFallback:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            try:
-                agent.run_conversation("hello")
-            except Exception:
-                # The fallback might not actually work in full loop due to
-                # error classification; check _fallback_attempted at minimum
-                pass
+            agent.run_conversation("hello")
 
-        # After fallback attempt, the agent should have fallback_attempted flag
-        # and the actual model should reflect the fallback
-        if agent._fallback_attempted:
-            # The final _actual_model_used from the last API call in the loop
-            # should be the fallback model
-            pass  # Verification depends on whether fallback succeeded
+        assert agent._actual_model_used == "deepseek/deepseek-chat-v4-flash"
+        call_models = [
+            call.kwargs["model"]
+            for call in agent.client.chat.completions.create.call_args_list
+        ]
+        assert call_models == [
+            "claude/claude-sonnet-4-20250514",
+            "deepseek/deepseek-chat-v4-flash",
+        ]
+
+    def test_self_escalation_sentinel_retries_with_model_fallback_without_routing(self):
+        """When a model asks for escalation, fallback model should be tried even
+        when routing is disabled."""
+        agent = _make_agent(model="deepseek/deepseek-chat-v4-flash")
+        # Explicitly disable routing so only self-escalation path remains.
+        agent._routing_config = {"enabled": False}
+
+        from agent.fallback_escalation import init_fallback_config
+        init_fallback_config({
+            "fallback": {
+                "enabled": True,
+                "models": {
+                    "deepseek/deepseek-chat-v4-flash": {
+                        "fallback": "anthropic/claude-sonnet-4"
+                    }
+                },
+                "self_escalation": {
+                    "enabled": True,
+                    "sentinel": "ESCALATE_TO_STRONGER_MODEL",
+                },
+            }
+        })
+
+        first = _mock_response(
+            content="ESCALATE_TO_STRONGER_MODEL: Need deeper reasoning",
+            model="deepseek/deepseek-chat-v4-flash",
+        )
+        second = _mock_response(
+            content="Escalated success",
+            model="anthropic/claude-sonnet-4",
+        )
+
+        agent.client.chat.completions.create = MagicMock(side_effect=[first, second])
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Escalated success"
+
+        call_models = [
+            call.kwargs["model"] for call in agent.client.chat.completions.create.call_args_list
+        ]
+        assert call_models == [
+            "deepseek/deepseek-chat-v4-flash",
+            "anthropic/claude-sonnet-4",
+        ]
+
+        final_messages = result["messages"]
+        assert final_messages[-1]["role"] == "assistant"
+        assert final_messages[-1]["content"] == "Escalated success"
+        assert "ESCALATE_TO_STRONGER_MODEL" not in final_messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------

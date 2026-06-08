@@ -75,6 +75,33 @@ def _patch_managed_uv(request):
         yield
 
 
+def _enter_fast_cmd_update_patches(stack, hm):
+    """Patch heavyweight post-pull update steps so tests can focus on git flow."""
+    stack.enter_context(patch.object(hm, "_run_pre_update_backup", return_value=None))
+    stack.enter_context(patch.object(hm, "_clean_managed_worktree", return_value=True))
+    stack.enter_context(patch.object(hm, "_stash_local_changes_if_needed", return_value=None))
+    stack.enter_context(patch.object(hm, "_invalidate_update_cache", return_value=None))
+    stack.enter_context(patch.object(hm, "_capture_head_sha", return_value="deadbeef"))
+    stack.enter_context(patch.object(hm, "_validate_critical_files_syntax", return_value=(True, None, None)))
+    stack.enter_context(patch.object(hm, "_clear_bytecode_cache", return_value=0))
+    stack.enter_context(patch.object(hm, "_install_python_dependencies_with_optional_fallback", return_value=None))
+    stack.enter_context(patch.object(hm, "_update_node_dependencies", return_value=None))
+    stack.enter_context(patch.object(hm, "_build_web_ui", return_value=None))
+    stack.enter_context(patch.object(hm, "_refresh_active_lazy_features", return_value=None))
+    stack.enter_context(patch.object(hm, "_wait_for_interpreter_venv_ready", return_value=None))
+    stack.enter_context(patch.object(hm, "_kill_stale_dashboard_processes", return_value=None))
+    stack.enter_context(patch.object(hm, "_print_curator_first_run_notice", return_value=None))
+    stack.enter_context(patch.object(hm, "_print_curator_recent_run_notice", return_value=None))
+    stack.enter_context(patch.object(hm._time, "sleep", return_value=None))
+    stack.enter_context(patch("tools.skills_sync.sync_skills", return_value={"copied": [], "updated": [], "user_modified": [], "cleaned": []}))
+    stack.enter_context(patch("hermes_cli.profiles.list_profiles", return_value=[]))
+    stack.enter_context(patch("hermes_cli.gateway.supports_systemd_services", return_value=False))
+    stack.enter_context(patch("hermes_cli.gateway.is_macos", return_value=False))
+    stack.enter_context(patch("hermes_cli.gateway.find_gateway_pids", return_value=[]))
+    stack.enter_context(patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]))
+    stack.enter_context(patch("hermes_cli.gateway._get_service_pids", return_value=set()))
+
+
 class TestCmdUpdatePip:
     """Regression tests for pip-install update flows."""
 
@@ -116,6 +143,20 @@ class TestCmdUpdatePip:
 
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_update_path(self, request):
+        """Keep fallback tests focused on branch-selection behavior."""
+        if request.node.name == "test_update_refreshes_repo_and_tui_node_dependencies":
+            yield
+            return
+
+        from contextlib import ExitStack
+        from hermes_cli import main as hm
+
+        with ExitStack() as stack:
+            _enter_fast_cmd_update_patches(stack, hm)
+            yield
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -225,7 +266,8 @@ class TestCmdUpdateBranchFallback:
         import subprocess as _subprocess
         build_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch.object(hm, "_is_termux_env", return_value=False), \
-             patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle:
+             patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle, \
+             patch.object(hm, "_web_ui_build_needed", return_value=True):
             cmd_update(mock_args)
 
         npm_calls = [
@@ -494,6 +536,23 @@ class TestCmdUpdateBranchFlag:
     The CLI default stays 'main'; --branch lets callers pick a different
     target without monkey-patching the implementation.
     """
+
+    @pytest.fixture(autouse=True)
+    def _fast_update_path(self):
+        """Keep branch-flag tests focused on git-branch control flow.
+
+        ``cmd_update()`` has grown a lot of post-pull work (dependency refresh,
+        skill sync, gateway restart, dashboard cleanup). These tests only care
+        about which git branch gets checked out / pulled, so patch the unrelated
+        heavyweight steps to no-op; otherwise the mocked happy-path update now
+        burns through pytest-timeout and hides the real branch assertion.
+        """
+        from contextlib import ExitStack
+        from hermes_cli import main as hm
+
+        with ExitStack() as stack:
+            _enter_fast_cmd_update_patches(stack, hm)
+            yield
 
     def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0"):
         """Mock side-effect that knows about checkout/track behavior.

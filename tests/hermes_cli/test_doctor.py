@@ -88,13 +88,20 @@ class TestDoctorEnvFileEncoding:
 
         monkeypatch.setattr(pathlib.Path, "read_text", gbk_like_read_text)
 
-        # Short-circuit the expensive tool-availability probe — we only
-        # need doctor to reach the .env read without crashing.
+        # Short-circuit the expensive later phases — we only need doctor to
+        # reach the .env read without crashing.
         fake_model_tools = types.SimpleNamespace(
             check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
             TOOLSET_REQUIREMENTS={},
         )
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        real_safe_which = doctor_mod._safe_which
+        monkeypatch.setattr(
+            doctor_mod,
+            "_safe_which",
+            lambda name: None if name == "npm" else real_safe_which(name),
+        )
 
         # Run doctor. If the .env read still uses locale encoding, this
         # raises UnicodeDecodeError and the test fails.

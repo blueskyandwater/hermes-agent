@@ -28,6 +28,7 @@ Non-transient errors (4xx except 429) are NOT escalated.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -39,13 +40,25 @@ _FALLBACK_CONFIG: dict = {}
 # Model → fallback model mapping, populated from config
 _FALLBACK_MODEL_MAP: dict[str, str] = {}
 
+# Optional self-escalation policy: allows a model to request a stronger model
+# by emitting a sentinel phrase in its response.
+_SELF_ESCALATION_CONFIG_ENABLED: bool = False
+_SELF_ESCALATION_SENTINEL: str = "ESCALATE_TO_STRONGER_MODEL"
+
 
 def init_fallback_config(config: dict) -> None:
     """Read fallback config from the agent config dict."""
     global _FALLBACK_CONFIG_ENABLED, _FALLBACK_CONFIG, _FALLBACK_MODEL_MAP
+    global _SELF_ESCALATION_CONFIG_ENABLED, _SELF_ESCALATION_SENTINEL
     cfg = config.get("fallback", {})
     _FALLBACK_CONFIG_ENABLED = bool(cfg.get("enabled", False))
     _FALLBACK_CONFIG = cfg
+    _SELF_ESCALATION_CONFIG_ENABLED = bool(
+        cfg.get("self_escalation", {}).get("enabled", False)
+    )
+    _SELF_ESCALATION_SENTINEL = str(
+        cfg.get("self_escalation", {}).get("sentinel", "ESCALATE_TO_STRONGER_MODEL")
+    )
     _FALLBACK_MODEL_MAP = {}
     models = cfg.get("models", {})
     if isinstance(models, dict):
@@ -55,7 +68,6 @@ def init_fallback_config(config: dict) -> None:
             elif isinstance(opts, str):
                 _FALLBACK_MODEL_MAP[primary] = opts
 
-
 def is_fallback_enabled() -> bool:
     """Is model-level fallback configured and enabled?"""
     return _FALLBACK_CONFIG_ENABLED
@@ -64,6 +76,45 @@ def is_fallback_enabled() -> bool:
 def get_fallback_model(selected_model: str) -> Optional[str]:
     """Return the fallback model for the given selected model, or None."""
     return _FALLBACK_MODEL_MAP.get(selected_model)
+
+
+def is_self_escalation_enabled() -> bool:
+    """Is model self-escalation enabled in config?"""
+    return _SELF_ESCALATION_CONFIG_ENABLED
+
+
+def get_self_escalation_sentinel() -> str:
+    """Return the configured escalation sentinel string."""
+    return (_SELF_ESCALATION_SENTINEL or "ESCALATE_TO_STRONGER_MODEL").strip()
+
+
+def detect_self_escalation_request(text: str) -> Optional[str]:
+    """Detect self-escalation request in assistant final response.
+
+    Accepted formats:
+      - ESCALATE_TO_STRONGER_MODEL
+      - ESCALATE_TO_STRONGER_MODEL: need stronger reasoning
+      - [System: ESCALATE_TO_STRONGER_MODEL — model is too weak]
+
+    Returns a stripped reason string when detected, else None.
+    """
+    if not text:
+        return None
+
+    sentinel = get_self_escalation_sentinel()
+    if not sentinel:
+        return None
+
+    pattern = re.compile(
+        rf"^(?:\s*\[?System:\s*)?\s*{re.escape(sentinel)}\b(?:\s*[:：\-—]\s*(?P<reason>.*))?",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+
+    reason = (match.group("reason") or "").strip()
+    return reason.rstrip("] ")
 
 
 def get_max_attempts() -> int:

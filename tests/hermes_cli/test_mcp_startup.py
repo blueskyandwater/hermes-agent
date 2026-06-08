@@ -46,10 +46,12 @@ def _agent_args(**overrides) -> Namespace:
 
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     stop = threading.Event()
+    started = threading.Event()
     calls = {"mcp": 0}
 
     def _blocking_discover():
         calls["mcp"] += 1
+        started.set()
         stop.wait()
 
     monkeypatch.setitem(
@@ -80,9 +82,12 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         start = time.monotonic()
         main_mod._prepare_agent_startup(_agent_args())
         elapsed = time.monotonic() - start
-        assert elapsed < 0.2
-        assert calls["mcp"] == 1
+        # This should return well before a blocking MCP discovery finishes, but
+        # leave headroom for scheduler jitter on loaded CI/full-suite runs.
+        assert elapsed < 0.5
         assert mcp_startup._mcp_discovery_thread is not None
+        assert started.wait(timeout=0.5)
+        assert calls["mcp"] == 1
         assert mcp_startup._mcp_discovery_thread.is_alive()
     finally:
         stop.set()

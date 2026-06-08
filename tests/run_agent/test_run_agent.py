@@ -4373,6 +4373,7 @@ class TestRunConversation:
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
+        agent._configured_max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
 
@@ -4426,6 +4427,7 @@ class TestRunConversation:
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""
         self._setup_agent(agent)
         agent.max_iterations = 2
+        agent._configured_max_iterations = 2
 
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
 

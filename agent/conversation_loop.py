@@ -1213,15 +1213,30 @@ def run_conversation(
         has_retried_429 = False
         restart_with_compressed_messages = False
         restart_with_length_continuation = False
-
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         # Bug A fix: track model-level fallback state within this retry loop
         _fallback_active = False
         _fallback_model_override = None
+        # Self-escalation fallback state may already be set if a previous
+        # retry was triggered by the same sentinel in this turn. Preserve the
+        # state across retry iterations so the stronger model request survives
+        # a plain ``continue`` boundary.
+        _self_escalation_fallback_active = bool(
+            getattr(agent, "_self_escalation_fallback_active", False)
+        )
+        _self_escalation_fallback_model = getattr(
+            agent, "_self_escalation_fallback_model", None
+        )
+        # Always clear sticky agent-level markers after capture so a stale
+        # state from a prior turn cannot leak into the next successful
+        # conversation call.
+        agent._self_escalation_fallback_active = False
+        agent._self_escalation_fallback_model = None
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1351,10 +1366,20 @@ def run_conversation(
                 # agent.model from the provider fallback entry.  This prevents
                 # primary-provider route models (e.g. openai-codex/gpt-5.5)
                 # from leaking into fallback providers (e.g. OpenRouter).
-                if _routing_enabled and agent._route_model:
-                    if _fallback_active and _fallback_model_override:
-                        api_kwargs["model"] = _fallback_model_override
-                    elif getattr(agent, "_fallback_activated", False) or getattr(agent, "_runtime_provider_fallback_active", False):
+                # Prefer explicit self-escalation fallback overrides over route
+                # model selection. Keep the state both in local variables and
+                # on the agent instance so retries cannot lose it across
+                # retries or unexpected control flow.
+                _model_override = None
+                if _self_escalation_fallback_active:
+                    _model_override = _self_escalation_fallback_model
+                elif _fallback_active:
+                    _model_override = _fallback_model_override
+
+                if _model_override:
+                    api_kwargs["model"] = _model_override
+                elif _routing_enabled and agent._route_model:
+                    if getattr(agent, "_fallback_activated", False) or getattr(agent, "_runtime_provider_fallback_active", False):
                         _fallback_route_model = get_fallback_route_model(
                             agent._route_type, agent._routing_config
                         )
@@ -2908,7 +2933,8 @@ def run_conversation(
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)
-                _request_model = api_kwargs.get("model", "") or getattr(agent, "model", "")
+                _safe_api_kwargs = api_kwargs if isinstance(api_kwargs, dict) else {}
+                _request_model = _safe_api_kwargs.get("model", "") or getattr(agent, "model", "")
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s "
                     "request_model=%s route_type=%s route_model=%s "
@@ -2927,7 +2953,7 @@ def run_conversation(
 
                 _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
-                _model = api_kwargs.get("model", "") or getattr(agent, "model", "unknown")
+                _model = _safe_api_kwargs.get("model", "") or getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
                 agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
@@ -3593,7 +3619,42 @@ def run_conversation(
                         "error": str(api_error),
                     }
 
+                # Allow model-level fallback on transient errors immediately,
+                # not only after retry budget exhaustion. Do this only when there
+                # is no provider-fallback chain and a mapped fallback model is
+                # configured for the current request model.
+                _is_transient_for_model_fallback = False
+                _has_fallback_model_candidate = False
+                try:
+                    from agent.fallback_escalation import is_transient_api_error
+                    from agent.fallback_escalation import get_fallback_model, is_fallback_enabled
+
+                    _is_transient_for_model_fallback = is_transient_api_error(
+                        api_error, status_code
+                    )
+                    _fallback_candidate_model = None
+                    if _is_transient_for_model_fallback and isinstance(_safe_api_kwargs, dict):
+                        _candidate_model = _safe_api_kwargs.get("model", "")
+                        _fallback_candidate_model = (
+                            get_fallback_model(_candidate_model)
+                            if is_fallback_enabled() and _candidate_model
+                            else None
+                        )
+                    _has_fallback_model_candidate = bool(_fallback_candidate_model)
+                except Exception:
+                    _is_transient_for_model_fallback = False
+                    _has_fallback_model_candidate = False
+
+                _should_enter_fallback_block = False
                 if retry_count >= max_retries:
+                    _should_enter_fallback_block = True
+                if not getattr(agent, "_fallback_chain", []):
+                    _should_enter_fallback_block = (
+                        _should_enter_fallback_block
+                        or (_is_transient_for_model_fallback and _has_fallback_model_candidate)
+                    )
+
+                if _should_enter_fallback_block:
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
@@ -3613,6 +3674,9 @@ def run_conversation(
                     if (
                         not getattr(agent, "_fallback_attempted", False)
                         and isinstance(api_kwargs, dict)
+                        and not getattr(agent, "_fallback_chain", [])
+                        and not getattr(agent, "_fallback_activated", False)
+                        and not getattr(agent, "_runtime_provider_fallback_active", False)
                     ):
                         _current_model = api_kwargs.get("model", "")
                         if _current_model:
@@ -3620,13 +3684,9 @@ def run_conversation(
                                 from agent.fallback_escalation import (
                                     get_fallback_model,
                                     is_fallback_enabled,
-                                    is_transient_api_error,
                                     derive_fallback_reason,
                                 )
-                                if (
-                                    is_fallback_enabled()
-                                    and is_transient_api_error(api_error, status_code)
-                                ):
+                                if is_fallback_enabled() and _is_transient_for_model_fallback:
                                     _fallback_model = get_fallback_model(_current_model)
                                     if _fallback_model:
                                         agent._fallback_attempted = True
@@ -3695,6 +3755,10 @@ def run_conversation(
                         primary_recovery_attempted = False
                         _fallback_active = False  # Bug B fix: provider fallback supersedes model-level
                         _fallback_model_override = None  # reset stale model fallback state
+                        _self_escalation_fallback_active = False
+                        _self_escalation_fallback_model = None
+                        agent._self_escalation_fallback_active = False
+                        agent._self_escalation_fallback_model = None
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
@@ -4716,7 +4780,94 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
-                
+                _safe_response_api_kwargs = api_kwargs if isinstance(api_kwargs, dict) else {}
+
+                # Self-escalation path: a lightweight model can explicitly
+                # request a stronger model by returning a sentinel.  This
+                # allows adaptive quality upgrades without provider fallback.
+                _self_escalation_reason = None
+                try:
+                    from agent.fallback_escalation import (
+                        detect_self_escalation_request,
+                        get_fallback_model,
+                        is_fallback_enabled,
+                        is_self_escalation_enabled,
+                    )
+                    _self_escalation_reason = detect_self_escalation_request(final_response)
+                    _self_escalation_source_model = (
+                        agent._request_model_used
+                        or agent._actual_model_used
+                        or _safe_response_api_kwargs.get("model", "")
+                        or ""
+                    )
+                    if (
+                        _self_escalation_reason is not None
+                        and is_fallback_enabled()
+                        and is_self_escalation_enabled()
+                        and not getattr(agent, "_fallback_attempted", False)
+                    ):
+                        _self_escalation_model = get_fallback_model(_self_escalation_source_model)
+                        if _self_escalation_model:
+                            _nudge_reason = (
+                                f" (reason: {_self_escalation_reason})"
+                                if _self_escalation_reason
+                                else ""
+                            )
+                            agent._fallback_attempted = True
+                            agent._fallback_from_model = _self_escalation_source_model
+                            agent._fallback_to_model = _self_escalation_model
+                            agent._fallback_reason = (
+                                f"self_escalation{_nudge_reason}"
+                            )
+                            _fallback_model_override = _self_escalation_model
+                            _fallback_active = True
+                            _self_escalation_fallback_active = True
+                            _self_escalation_fallback_model = _self_escalation_model
+                            agent._self_escalation_fallback_active = True
+                            agent._self_escalation_fallback_model = _self_escalation_model
+                            api_kwargs = dict(_safe_response_api_kwargs)
+                            api_kwargs["model"] = _self_escalation_model
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            agent._buffer_status(
+                                f"⚠️ {_self_escalation_source_model} requested stronger model — "
+                                f"retrying with {_self_escalation_model}"
+                            )
+                            logger.info(
+                                "Self-escalation requested: %s -> %s (reason=%s)",
+                                _self_escalation_source_model,
+                                _self_escalation_model,
+                                _self_escalation_reason or "not provided",
+                            )
+                            _nudge_msg = agent._build_assistant_message(
+                                assistant_message, "incomplete"
+                            )
+                            _nudge_msg["content"] = "(self-escalation retry)"
+                            _nudge_msg["_self_escalation"] = True
+                            messages.append(_nudge_msg)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "[System] The previous model requested a stronger model. "
+                                    "Retry this request with a stronger reasoning model "
+                                    "to complete it.\n\n"
+                                    f"Reason: {_self_escalation_reason or 'not specified'}"
+                                ),
+                                "_self_escalation": True,
+                            })
+                            continue
+                        # No configured fallback model for this lightweight model.
+                        # Surface this as a clear final message instead of leaking
+                        # the raw sentinel to user-facing output.
+                        final_response = (
+                            "Current model reported that it needs a stronger model, "
+                            "but no escalation fallback model is configured for "
+                            f"{_self_escalation_source_model}."
+                        )
+                except Exception:
+                    pass
+
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 # Pop thinking-only prefill and empty-response retry
@@ -4730,9 +4881,22 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_self_escalation")
                     )
                 ):
                     messages.pop()
+
+                # Keep in-memory and persisted transcript aligned with the
+                # user-facing final text (no internal scaffold text).
+                final_msg["content"] = final_response
+
+                # Self-escalation request/override state is a retry-only marker;
+                # clear it once we have a final assistant response so future
+                # turns don't accidentally inherit an old model override.
+                agent._self_escalation_fallback_active = False
+                agent._self_escalation_fallback_model = None
+                _self_escalation_fallback_active = False
+                _self_escalation_fallback_model = None
 
                 messages.append(final_msg)
                 
@@ -4798,6 +4962,7 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    _budget_exhausted = False
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -4805,6 +4970,7 @@ def run_conversation(
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
+        _budget_exhausted = True
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
             f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
@@ -4872,8 +5038,8 @@ def run_conversation(
     # Determine if conversation completed successfully
     completed = (
         final_response is not None
-        and api_call_count < agent.max_iterations
         and not failed
+        and not _budget_exhausted
     )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal

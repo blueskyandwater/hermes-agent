@@ -838,6 +838,10 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "max_attempts": 2,
         "models": {},
+        "self_escalation": {
+            "enabled": True,
+            "sentinel": "ESCALATE_TO_STRONGER_MODEL",
+        },
     },
     "agent": {
         "max_turns": 90,

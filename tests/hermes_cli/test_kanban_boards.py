@@ -468,13 +468,53 @@ class TestWorkerSpawnEnv:
 # ---------------------------------------------------------------------------
 
 def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.CompletedProcess:
-    """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree."""
-    env = dict(os.environ)
+    """Run ``hermes kanban …`` with a hermetic Hermes env.
+
+    Suite-only failures here are usually caused by unrelated tests leaking
+    process-level ``HERMES_*`` flags (for example ignore-user-config or other
+    startup toggles) into this subprocess helper via ``os.environ``. Those
+    flags are not part of this test's contract; the helper only needs the
+    worktree on ``PYTHONPATH`` plus the explicit per-call overrides such as
+    ``HERMES_HOME``.
+
+    When ``HERMES_TEST_DEBUG_KANBAN_SUBPROCESS=1`` is set, emit timing markers
+    so suite-only hangs reveal which CLI invocation stalled.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
     env["PYTHONPATH"] = str(_WORKTREE)
     if env_extra:
         env.update(env_extra)
+    # hermes_cli.main pre-parses profiles before argparse and consults
+    # ``Path.home()/.hermes/active_profile`` unless HERMES_HOME already looks
+    # like a profile namespace.  A bare tmp_path HERMES_HOME (used by these
+    # tests) therefore still consults the *real* HOME unless we sandbox HOME
+    # too, which makes subprocess runs order-dependent on unrelated profile
+    # tests. Point HOME at a temp parent so active_profile/profile side files
+    # resolve inside the hermetic sandbox instead of the developer machine.
+    hermes_home = env.get("HERMES_HOME", "").strip()
+    if hermes_home and "HOME" not in (env_extra or {}):
+        env["HOME"] = str(Path(hermes_home).resolve().parent)
+    debug = os.environ.get("HERMES_TEST_DEBUG_KANBAN_SUBPROCESS") == "1"
+    cmd = [sys.executable, "-m", "hermes_cli.main", "kanban"] + args
+    if debug:
+        import time
+        start = time.monotonic()
+        print(f"[kanban-cli start] {' '.join(args)}", file=sys.stderr, flush=True)
+        try:
+            res = subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                cwd=str(_WORKTREE),
+                timeout=30,
+            )
+        finally:
+            elapsed = time.monotonic() - start
+            print(f"[kanban-cli end] {' '.join(args)} elapsed={elapsed:.2f}s", file=sys.stderr, flush=True)
+        return res
     return subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban"] + args,
+        cmd,
         env=env,
         capture_output=True,
         text=True,
@@ -508,16 +548,19 @@ class TestCLI:
         cur = [b for b in data if b["is_current"]][0]
         assert cur["slug"] == "myproj"
 
-    def test_per_board_task_isolation_via_cli(self, tmp_path):
-        env = {"HERMES_HOME": str(tmp_path)}
-        assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
-        assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
+    def test_per_board_task_isolation_via_cli(self, fresh_home):
+        # Keep this test focused on the CLI routing contract (``--board`` and
+        # current-board resolution) rather than paying seven cold-start
+        # subprocess launches for setup. The old all-CLI workflow regularly ran
+        # ~28-35s and flaked under pytest-timeout's 30s test budget.
+        kb.create_board("projA")
+        kb.create_board("projB")
+        with kb.connect_closing(board="projA") as conn:
+            kb.create_task(conn, title="Task A", assignee="dev")
+        with kb.connect_closing(board="projB") as conn:
+            kb.create_task(conn, title="Task B", assignee="dev")
 
-        # Create one task on each via --board.
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
-        assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
-        assert r.returncode == 0, r.stderr
+        env = {"HERMES_HOME": str(fresh_home)}
 
         # list on each board only shows its own.
         listA = _cli(["--board", "projA", "list", "--json"], env_extra=env)

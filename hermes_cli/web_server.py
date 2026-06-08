@@ -451,6 +451,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "code_execution": "agent",
     "prompt_caching": "agent",
     "goals": "agent",
+    # `command_bypass.enabled` is currently a single boolean toggle; keep it
+    # with the rest of the agent/runtime behavior tabs instead of a singleton.
+    "command_bypass": "agent",
     # Only `telegram.reactions` currently lives under telegram — fold it in
     # with the other messaging-platform config (discord) so it isn't an
     # orphan tab of one field.

@@ -42,11 +42,25 @@ import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from fastapi import UploadFile
+
+try:  # Optional at runtime; FastAPI's File/Form endpoints require python-multipart.
+    try:
+        import python_multipart  # type: ignore  # noqa: F401
+    except Exception:
+        import multipart  # type: ignore  # noqa: F401
+    from fastapi import File, Form
+    _MULTIPART_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised by import-only tests / lean installs
+    File = Form = None  # type: ignore[assignment]
+    _MULTIPART_AVAILABLE = False
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -684,79 +698,84 @@ def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
         conn.close()
 
 
-@router.post("/tasks/{task_id}/attachments")
-async def upload_task_attachment(
-    task_id: str,
-    file: UploadFile = File(...),
-    board: Optional[str] = Query(None),
-    uploaded_by: Optional[str] = Form(None),
-):
-    """Store an uploaded file for a task and record its metadata.
+if _MULTIPART_AVAILABLE:
+    assert File is not None and Form is not None
+    _required_upload_file = cast(Any, File)(...)
+    _optional_uploaded_by = cast(Any, Form)(None)
 
-    The blob lands under ``attachments_root(board)/<task_id>/`` with a
-    sanitised, collision-resolved name. The worker reads it via the
-    absolute path surfaced in ``build_worker_context``.
-    """
-    board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    @router.post("/tasks/{task_id}/attachments")
+    async def upload_task_attachment(
+        task_id: str,
+        file: "UploadFile" = _required_upload_file,
+        board: Optional[str] = Query(None),
+        uploaded_by: Optional[str] = _optional_uploaded_by,
+    ):
+        """Store an uploaded file for a task and record its metadata.
 
-        safe_name = _safe_attachment_name(file.filename or "")
-
-        # Stream to disk with a hard size cap so a huge upload can't fill
-        # the disk. Read in chunks; abort + clean up if the cap is hit.
-        dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
-        stem, dot, ext = safe_name.partition(".")
-        candidate = safe_name
-        n = 1
-        while (dest_dir / candidate).exists():
-            candidate = f"{stem} ({n}){dot}{ext}"
-            n += 1
-        dest_path = dest_dir / candidate
-
-        total = 0
+        The blob lands under ``attachments_root(board)/<task_id>/`` with a
+        sanitised, collision-resolved name. The worker reads it via the
+        absolute path surfaced in ``build_worker_context``.
+        """
+        board = _resolve_board(board)
+        conn = _conn(board=board)
         try:
-            with open(dest_path, "wb") as out:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _MAX_ATTACHMENT_BYTES:
-                        out.close()
-                        dest_path.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"attachment exceeds {_MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
-                            ),
-                        )
-                    out.write(chunk)
-        except HTTPException:
-            raise
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+            if kanban_db.get_task(conn, task_id) is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
-        att_id = kanban_db.add_attachment(
-            conn,
-            task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
-            content_type=file.content_type,
-            size=total,
-            uploaded_by=(uploaded_by or "dashboard"),
-        )
-        att = kanban_db.get_attachment(conn, att_id)
-        return {"attachment": _attachment_dict(att) if att else None}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
+            safe_name = _safe_attachment_name(file.filename or "")
+
+            # Stream to disk with a hard size cap so a huge upload can't fill
+            # the disk. Read in chunks; abort + clean up if the cap is hit.
+            dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
+            stem, dot, ext = safe_name.partition(".")
+            candidate = safe_name
+            n = 1
+            while (dest_dir / candidate).exists():
+                candidate = f"{stem} ({n}){dot}{ext}"
+                n += 1
+            dest_path = dest_dir / candidate
+
+            total = 0
+            try:
+                with open(dest_path, "wb") as out:
+                    while True:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _MAX_ATTACHMENT_BYTES:
+                            out.close()
+                            dest_path.unlink(missing_ok=True)
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"attachment exceeds {_MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+                                ),
+                            )
+                        out.write(chunk)
+            except HTTPException:
+                raise
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+
+            att_id = kanban_db.add_attachment(
+                conn,
+                task_id,
+                filename=candidate,
+                stored_path=str(dest_path.resolve()),
+                content_type=file.content_type,
+                size=total,
+                uploaded_by=(uploaded_by or "dashboard"),
+            )
+            att = kanban_db.get_attachment(conn, att_id)
+            return {"attachment": _attachment_dict(att) if att else None}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        finally:
+            conn.close()
 
 
 @router.get("/attachments/{attachment_id}")

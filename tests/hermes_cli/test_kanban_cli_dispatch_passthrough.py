@@ -19,14 +19,34 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    Important: these tests need a cold import so ``hermes_cli.kanban`` picks
+    up the temporary home/config, but blindly deleting modules from
+    ``sys.modules`` leaks a second live ``hermes_cli.kanban_db`` instance into
+    later tests. Anything that imported ``kanban_db`` at collection time keeps
+    the old module object, while a later ``import hermes_cli.kanban_db`` sees
+    the new one — splitting globals like ``_recent_worker_exits`` and causing
+    suite-only failures.
+
+    Preserve and restore the removed module objects after the test so the rest
+    of the suite sees the original import graph again.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+
+    removed_modules = {}
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+            removed_modules[mod] = sys.modules.pop(mod)
+    try:
+        yield test_home
+    finally:
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                sys.modules.pop(mod, None)
+        sys.modules.update(removed_modules)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
