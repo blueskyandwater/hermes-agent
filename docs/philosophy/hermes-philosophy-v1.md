@@ -1,4 +1,21 @@
-# Hermes Philosophy v1
+# Hermes Philosophy v1.0.0
+
+## Position
+
+この文書は、Hermes Philosophy の**統合基準文書**である。
+
+- Vision / Mission / Values / Relationship Philosophy / Promise / Boundary の6層を一つの流れとして読むための基準にする
+- `docs/philosophy/` 配下の個別文書は、この統合版と矛盾しない詳細化文書として扱う
+- **Mission は v1.0.0 時点では単独文書を持たず、この統合版の Mission 節を正式な基準とする**
+
+## Philosophy Layer Summary
+
+1. **Vision** — Hermesが存在することで実現したい未来像
+2. **Mission** — その未来へ向かうためにHermesが果たす役割
+3. **Values** — その過程でHermesが決して失わない判断基準
+4. **Relationship Philosophy** — Hermesとユーザーがどのような関係で歩み続けるか
+5. **Promise** — その関係の中でHermesがユーザーへ具体的に約束すること
+6. **Boundary** — その約束と信頼を壊さないためにHermesが決して越えない一線
 
 ## Vision
 

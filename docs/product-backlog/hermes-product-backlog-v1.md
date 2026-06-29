@@ -395,20 +395,20 @@ Continuous Evolution
    - 感情整理 / perspective提示 / synthesis / growth支援の運用境界を固める
 8. **Investment pipeline の分離**
    - 一般相談と投資判断支援を混線させない設計にする
-9. **Mission stability rule の明文化**
-   - Mission変更には明示承認が必要という運用ルールを backlog 上でも見える化する
-10. **Vision stability rule の明文化**
+9. **Mission stability rule の運用反映確認**
+   - Mission変更には明示承認が必要という運用ルールを backlog / Kanban / review artifacts 上でも整合させる
+10. **Vision stability rule の運用反映確認**
    - VisionはMissionより上位の未来像として扱い、モデル/API/実装変更では変えない
-   - Vision変更にはユーザーの明示承認が必要という運用ルールを backlog 上でも見える化する
-11. **Relationship stability rule の明文化**
+   - Vision変更にはユーザーの明示承認が必要という運用ルールを backlog / Kanban / review artifacts 上でも整合させる
+11. **Relationship stability rule の運用反映確認**
    - Relationship Philosophy は長期的な関係規範として扱い、短期改善では変更しない
-   - 変更にはユーザーの明示承認が必要という運用ルールを backlog 上でも見える化する
-12. **Promise stability rule の明文化**
+   - 変更にはユーザーの明示承認が必要という運用ルールを backlog / Kanban / review artifacts 上でも整合させる
+12. **Promise stability rule の運用反映確認**
    - Promise はユーザーへの長期約束として扱い、Mission より低頻度・Values 同等の安定性で維持する
-   - 変更には Human Approval / Version Update / Change Log を必須とする
-13. **Boundary stability rule の明文化**
+   - 変更には Human Approval / Version Update / Change Log を必須とすることを backlog / Kanban / review artifacts 上でも整合させる
+13. **Boundary stability rule の運用反映確認**
    - Boundary は Promise を守る最終安全装置として扱い、新機能や短期改善より優先する
-   - 変更には Human Approval / Version Update / Change Log を必須とする
+   - 変更には Human Approval / Version Update / Change Log を必須とすることを backlog / Kanban / review artifacts 上でも整合させる
 
 ## 12. Roadmap v1
 
@@ -425,6 +425,10 @@ Continuous Evolution
 - 実装はまだ行わない
 
 ### Sprint 2
+- Epic 1 Hermes Philosophy v1.0.0 finalization
+- 統合版 `hermes-philosophy-v1.md` を基準文書として最終整形
+- 6層整合性確認（Vision / Mission / Values / Relationship Philosophy / Promise / Boundary）
+- Product Backlog / Kanban コメント / Review Worker 監査の整合確認
 - Judge
 - Metrics
 - Quality Dashboard の最小形
@@ -477,7 +481,7 @@ Sprint 1では、Hermes Product Backlog v1 は **Planning で止める**。
 
 を Kanban 上で管理できるようになる。
 
-加えて、Vision / Mission / Values / Relationship Philosophy が固定されたことで、Hermes は
+加えて、Vision / Mission / Values / Relationship Philosophy / Promise / Boundary が固定されたことで、Hermes は
 
 - 人間がAIと協調し、自分らしく納得感のある人生を歩み続けられる未来を支える
 - ユーザーの代わりに決めない
