@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import subprocess
 
-from agent.ephemeral_decision_support import format_ephemeral_decision_support
+from agent.ephemeral_decision_support import (
+    build_ephemeral_decision_support_if_allowed,
+    format_ephemeral_decision_support,
+)
 
 
 SAMPLE_DECISION_SUPPORT_CONTEXT = "\n".join(
@@ -76,6 +79,103 @@ def test_empty_inputs_return_safe_empty_decision_support_context():
         assert formatted.startswith("<ephemeral_decision_support>\n")
         assert "<decision_support_context>\n</decision_support_context>" in formatted
         assert formatted.endswith("\n</ephemeral_decision_support>")
+
+
+def test_guard_returns_none_without_explicit_opt_in():
+    assert (
+        build_ephemeral_decision_support_if_allowed(
+            SAMPLE_DECISION_SUPPORT_CONTEXT,
+            inject_decision_support=False,
+        )
+        is None
+    )
+
+
+def test_guard_returns_none_without_context():
+    assert (
+        build_ephemeral_decision_support_if_allowed(
+            None,
+            inject_decision_support=True,
+        )
+        is None
+    )
+
+
+def test_guard_returns_none_for_empty_or_whitespace_context():
+    for empty_context in ("", "   \n\t  "):
+        assert (
+            build_ephemeral_decision_support_if_allowed(
+                empty_context,
+                inject_decision_support=True,
+            )
+            is None
+        )
+
+
+def test_guard_returns_none_for_unfenced_context():
+    assert (
+        build_ephemeral_decision_support_if_allowed(
+            "This is decision support context, but it is not fenced.",
+            inject_decision_support=True,
+        )
+        is None
+    )
+
+
+def test_guard_returns_wrapper_for_valid_context_with_explicit_opt_in():
+    guarded = build_ephemeral_decision_support_if_allowed(
+        SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=True,
+    )
+
+    assert guarded is not None
+    assert guarded.startswith("<ephemeral_decision_support>\n")
+    assert guarded.endswith("\n</ephemeral_decision_support>")
+    assert SAMPLE_DECISION_SUPPORT_CONTEXT in guarded
+
+
+def test_guard_allows_safety_phrases_that_negate_final_decision_or_recommendation():
+    safe_context = "\n".join(
+        [
+            "<decision_support_context>",
+            "This is not a final decision and not a recommendation.",
+            "It only helps the user compare options.",
+            "</decision_support_context>",
+        ]
+    )
+
+    guarded = build_ephemeral_decision_support_if_allowed(
+        safe_context,
+        inject_decision_support=True,
+    )
+
+    assert guarded is not None
+    assert safe_context in guarded
+
+
+def test_guard_rejects_forceful_recommendation_phrases():
+    unsafe_contexts = [
+        "I recommend choosing option A.",
+        "You should choose option A.",
+        "You must choose option A.",
+    ]
+
+    for unsafe_text in unsafe_contexts:
+        fenced_context = "\n".join(
+            [
+                "<decision_support_context>",
+                unsafe_text,
+                "</decision_support_context>",
+            ]
+        )
+
+        assert (
+            build_ephemeral_decision_support_if_allowed(
+                fenced_context,
+                inject_decision_support=True,
+            )
+            is None
+        )
 
 
 def test_guardrail_files_are_not_changed_by_formatter_story():
