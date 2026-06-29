@@ -6,6 +6,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
+- POST /v1/audio/transcriptions    — OpenAI-compatible speech-to-text transcription
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
@@ -40,6 +41,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -864,9 +866,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
 
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
+        # Accept canonical Bearer syntax plus case-insensitive variants and
+        # tolerate extra whitespace. Also accept raw token values for clients
+        # that omit the scheme (common in some legacy scripts/tests).
+        scheme, sep, token = auth_header.partition(" ")
+        if sep:
+            if scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), self._api_key):
+                return None  # Auth OK
+        else:
+            # Backward-compatible fallback for "Authorization: <token>".
+            if auth_header.strip() == self._api_key:
                 return None  # Auth OK
 
         logger.warning(
@@ -1127,7 +1136,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1139,6 +1148,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "audio_transcriptions": {"method": "POST", "path": "/v1/audio/transcriptions"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -2000,6 +2010,127 @@ class APIServerAdapter(BasePlatformAdapter):
                 response_headers["X-Hermes-Error"] = err_msg[:200]
 
         return web.json_response(response_data, headers=response_headers)
+
+    async def _handle_audio_transcriptions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/audio/transcriptions — OpenAI-compatible transcription."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        if "multipart/form-data" not in request.content_type.lower():
+            return web.json_response(
+                _openai_error(
+                    "Invalid Content-Type for audio transcriptions; expected multipart/form-data",
+                    code="invalid_content_type",
+                ),
+                status=400,
+            )
+
+        model: Optional[str] = None
+        response_format = "text"
+        saved_path: Optional[str] = None
+
+        try:
+            multipart_reader = await request.multipart()
+            saw_file = False
+
+            while True:
+                part = await multipart_reader.next()
+                if part is None:
+                    break
+
+                if part.name == "file":
+                    # Ignore duplicated files and keep the first one.
+                    if saw_file:
+                        await part.release()
+                        continue
+
+                    saved_file_name = part.filename or "audio.wav"
+                    suffix = Path(saved_file_name).suffix.lower()
+                    if not suffix:
+                        suffix = ".wav"
+                    fd, temp_path = tempfile.mkstemp(prefix="hermes-transcription-", suffix=suffix)
+                    os.close(fd)
+                    saved_path = temp_path
+                    saw_file = True
+
+                    try:
+                        with open(temp_path, "wb") as out_f:
+                            while True:
+                                chunk = await part.read_chunk()
+                                if not chunk:
+                                    break
+                                out_f.write(chunk)
+                    finally:
+                        await part.release()
+
+                elif part.name == "model":
+                    model = (await part.text()).strip() or None
+                    await part.release()
+                elif part.name == "response_format":
+                    response_format = (await part.text()).strip() or response_format
+                    await part.release()
+                else:
+                    await part.release()
+
+            if not saw_file or saved_path is None:
+                return web.json_response(
+                    _openai_error("Missing required field 'file'", code="missing_field"),
+                    status=400,
+                )
+
+            try:
+                from tools.transcription_tools import transcribe_audio
+            except Exception:
+                return web.json_response(
+                    _openai_error(
+                        "Server is missing the transcription tool dependency",
+                        code="audio_dependency_missing",
+                    ),
+                    status=500,
+                )
+
+            result = transcribe_audio(file_path=saved_path, model=model)
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(f"Failed to parse transcription request: {exc}", code="invalid_request_error"),
+                status=400,
+            )
+        finally:
+            if saved_path is not None:
+                try:
+                    os.remove(saved_path)
+                except FileNotFoundError:
+                    pass
+
+        if not result.get("success"):
+            return web.json_response(
+                _openai_error(
+                    result.get("error", "Audio transcription failed"),
+                    code="audio_transcription_failed",
+                ),
+                status=400,
+            )
+
+        response_format = response_format.lower()
+        transcript = result.get("transcript", "")
+        if response_format in {"text", "json", "verbose_json"}:
+            payload = {"text": transcript}
+            if response_format == "verbose_json":
+                payload.update({
+                    "language": None,
+                    "duration": None,
+                    "segments": [],
+                })
+            return web.json_response(payload)
+
+        return web.json_response(
+            _openai_error(
+                f"Unsupported response_format '{response_format}'",
+                code="invalid_request_error",
+            ),
+            status=400,
+        )
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -4104,13 +4235,19 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            # Accept both canonical and trailing-slash variants used by some
+            # OpenAI clients to avoid opaque 404 errors on strict path matching.
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/v1/models/", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/capabilities/", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
+            self._app.router.add_post("/api/sessions/", self._handle_create_session)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
@@ -4119,9 +4256,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_post("/v1/chat/completions/", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_post("/v1/audio/transcriptions", self._handle_audio_transcriptions)
+            self._app.router.add_post("/v1/audio/transcriptions/", self._handle_audio_transcriptions)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

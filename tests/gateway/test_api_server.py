@@ -21,7 +21,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -358,6 +358,20 @@ class TestAuth:
         mock_request.headers = {"Authorization": "Bearer sk-test123"}
         assert adapter._check_auth(mock_request) is None
 
+    def test_authorization_scheme_is_case_insensitive(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": "bearer sk-test123"}
+        assert adapter._check_auth(mock_request) is None
+
+    def test_raw_token_authorization_fallback(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": "sk-test123"}
+        assert adapter._check_auth(mock_request) is None
+
     def test_invalid_key_returns_401(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
         adapter = APIServerAdapter(config)
@@ -411,13 +425,18 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/v1/models/", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/v1/capabilities/", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/chat/completions/", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
+    app.router.add_post("/v1/audio/transcriptions/", adapter._handle_audio_transcriptions)
     return app
 
 
@@ -657,9 +676,11 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["features"]["audio_api"] is True
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["audio_transcriptions"] == {"method": "POST", "path": "/v1/audio/transcriptions"}
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -675,6 +696,51 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+class TestAudioTranscriptionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_audio_transcriptions_returns_text(self, adapter):
+        app = _create_app(adapter)
+        form = FormData()
+        form.add_field("file", b"fakeaudio", filename="sample.wav", content_type="audio/wav")
+        form.add_field("model", "whisper-1")
+        form.add_field("response_format", "text")
+
+        with patch("tools.transcription_tools.transcribe_audio") as mocked_transcribe:
+            mocked_transcribe.return_value = {
+                "success": True,
+                "transcript": "hello from stt",
+                "provider": "openai",
+            }
+
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=form,
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["text"] == "hello from stt"
+
+    @pytest.mark.asyncio
+    async def test_audio_transcriptions_requires_file(self, adapter):
+        app = _create_app(adapter)
+        form = FormData(default_to_multipart=True)
+        form.add_field("model", "whisper-1")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/audio/transcriptions",
+                data=form,
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["code"] == "missing_field"
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +897,25 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_trailing_slash_path_is_supported(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        with patch.object(
+            auth_adapter,
+            "_run_agent",
+            return_value=(
+                {"final_response": "ok", "messages": [], "api_calls": 0},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions/",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"model": "test", "messages": [{"role": "user", "content": "ping"}]},
+                )
+                assert resp.status == 200
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)

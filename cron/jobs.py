@@ -68,6 +68,32 @@ def _job_output_dir(job_id: str) -> Path:
     return OUTPUT_DIR / text
 
 
+def _read_hermes_env(name: str) -> Optional[str]:
+    """Read a single key from ``$HERMES_HOME/.env`` without importing full env parsing.
+
+    Narrow-purpose helper so cron job creation can resolve a stable default
+    delivery target (e.g. ``DISCORD_HOME_CHANNEL``) when the caller didn't pass
+    one explicitly.
+    """
+    env_path = HERMES_DIR / ".env"
+    if not env_path.exists():
+        return None
+
+    try:
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() != name:
+                continue
+            value = value.split("#", 1)[0]
+            return value.strip().strip('"').strip("'")
+        return None
+    except Exception:
+        return None
+
+
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
     if skills is None:
@@ -628,9 +654,25 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
+    # Default delivery policy:
+    # - if caller omitted `deliver`, prefer an explicit default target from env
+    #   so new cron jobs land in a stable destination by default
+    #   (e.g. HERMES_CRON_DEFAULT_DELIVER="discord:123..." or
+    #   "origin" to preserve legacy behavior).
+    # - if no explicit default is configured, prefer Discord home if configured,
+    #   then keep legacy fallback.
     if deliver is None:
-        deliver = "origin" if origin else "local"
+        deliver = os.getenv("HERMES_CRON_DEFAULT_DELIVER")
+        if deliver is None:
+            deliver = _read_hermes_env("HERMES_CRON_DEFAULT_DELIVER")
+        if deliver is None:
+            discord_home = os.getenv("DISCORD_HOME_CHANNEL")
+            if not discord_home:
+                discord_home = _read_hermes_env("DISCORD_HOME_CHANNEL")
+            if discord_home:
+                deliver = f"discord:{discord_home}"
+            else:
+                deliver = "origin" if origin else "local"
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()

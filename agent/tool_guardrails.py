@@ -423,6 +423,74 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     )
 
 
+
+def escalate_warning_to_soft_halt(
+    decision: ToolGuardrailDecision,
+    config: ToolCallGuardrailConfig,
+) -> ToolGuardrailDecision | None:
+    """Convert select warning decisions into a hard stop when hard-stop mode is off.
+
+    This prevents infinite retry loops in sessions where the opt-in hard-stop flag is
+    disabled but warning thresholds are repeatedly exceeded.
+    """
+
+    if config.hard_stop_enabled or not config.warnings_enabled:
+        return None
+    if not decision.signature:
+        return None
+
+    if (
+        decision.code == "repeated_exact_failure_warning"
+        and decision.count >= config.exact_failure_block_after
+    ):
+        return ToolGuardrailDecision(
+            action="halt",
+            code="repeated_exact_failure_block",
+            message=(
+                f"Stopped {decision.tool_name}: the same tool call failed "
+                f"{decision.count} times with identical arguments. Do not retry unchanged "
+                "and change strategy before retrying."
+            ),
+            tool_name=decision.tool_name,
+            count=decision.count,
+            signature=decision.signature,
+        )
+
+    if (
+        decision.code == "same_tool_failure_warning"
+        and decision.count >= config.same_tool_failure_halt_after
+    ):
+        return ToolGuardrailDecision(
+            action="halt",
+            code="same_tool_failure_halt",
+            message=(
+                f"Stopped {decision.tool_name}: it failed {decision.count} times with "
+                "this turn. Stop retrying the same tool path and choose a different "
+                "approach."
+            ),
+            tool_name=decision.tool_name,
+            count=decision.count,
+            signature=decision.signature,
+        )
+
+    if (
+        decision.code == "idempotent_no_progress_warning"
+        and decision.count >= config.no_progress_block_after
+    ):
+        return ToolGuardrailDecision(
+            action="halt",
+            code="idempotent_no_progress_block",
+            message=(
+                f"Stopped {decision.tool_name}: it returned the same idempotent result "
+                f"{decision.count} times. Change query/arguments before retrying."
+            ),
+            tool_name=decision.tool_name,
+            count=decision.count,
+            signature=decision.signature,
+        )
+
+    return None
+
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
 

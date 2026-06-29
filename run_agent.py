@@ -173,6 +173,7 @@ from agent.codex_responses_adapter import (
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
     append_toolguard_guidance,
+    escalate_warning_to_soft_halt,
     toolguard_synthetic_result,
 )
 from agent.tool_result_classification import (
@@ -4758,6 +4759,10 @@ class AIAgent:
             function_result,
             failed=failed,
         )
+        soft_halt = escalate_warning_to_soft_halt(decision, self._tool_guardrails.config)
+        if soft_halt is not None:
+            decision = soft_halt
+            function_result = toolguard_synthetic_result(decision)
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
