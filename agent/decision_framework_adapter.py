@@ -14,17 +14,9 @@ from agent.decision_framework import (
     DecisionFrameworkOutput,
     run_decision_framework,
 )
+from agent.human_model_snapshot import normalize_human_model_snapshot
 
 __all__ = ["build_decision_support_context"]
-
-_ALLOWED_HUMAN_MODEL_FIELDS = (
-    "identity",
-    "energy",
-    "habit",
-    "growth",
-    "communication",
-    "coaching",
-)
 
 _SYNTHESIS_SECTIONS = (
     ("options", "Options"),
@@ -49,12 +41,7 @@ def build_decision_support_context(
 def _build_decision_framework_input(
     human_model_snapshot: Mapping[str, Any] | None,
 ) -> DecisionFrameworkInput:
-    snapshot = human_model_snapshot if isinstance(human_model_snapshot, Mapping) else {}
-    values = {
-        field_name: dict(value) if isinstance(value, Mapping) else {}
-        for field_name in _ALLOWED_HUMAN_MODEL_FIELDS
-        for value in [snapshot.get(field_name, {})]
-    }
+    values = normalize_human_model_snapshot(human_model_snapshot)
     return DecisionFrameworkInput(**values)
 
 
