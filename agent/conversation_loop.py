@@ -28,6 +28,9 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.ephemeral_decision_support import (
+    build_ephemeral_decision_support_if_allowed,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -136,6 +139,36 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _with_ephemeral_decision_support_for_api_msg(
+    api_msg: dict[str, Any],
+    *,
+    is_current_turn_user: bool,
+    decision_support_context: str | None,
+    inject_decision_support: bool = False,
+) -> dict[str, Any]:
+    """Return a copied api_msg with guarded decision support appended when allowed."""
+
+    copied = api_msg.copy()
+    if not is_current_turn_user:
+        return copied
+    if copied.get("role") != "user":
+        return copied
+
+    base_content = copied.get("content", "")
+    if not isinstance(base_content, str):
+        return copied
+
+    guarded = build_ephemeral_decision_support_if_allowed(
+        decision_support_context,
+        inject_decision_support=inject_decision_support,
+    )
+    if guarded is None:
+        return copied
+
+    copied["content"] = base_content + "\n\n" + guarded
+    return copied
 
 
 def _nous_entitlement_message(capability: str) -> str:
@@ -377,6 +410,8 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    decision_support_context: str | None = None,
+    inject_decision_support: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -392,7 +427,10 @@ def run_conversation(
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
-                or queuing follow-up prefetch work.
+        decision_support_context: Optional prebuilt decision support context.
+            This function does not generate it.
+        inject_decision_support: Explicit opt-in guard for appending
+            ephemeral decision support to the current user api_msg copy only.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1022,6 +1060,15 @@ def run_conversation(
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
                         api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+
+            api_msg = _with_ephemeral_decision_support_for_api_msg(
+                api_msg,
+                is_current_turn_user=(
+                    idx == current_turn_user_idx and msg.get("role") == "user"
+                ),
+                decision_support_context=decision_support_context,
+                inject_decision_support=inject_decision_support,
+            )
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

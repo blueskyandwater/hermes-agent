@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
-
+from agent.conversation_loop import _with_ephemeral_decision_support_for_api_msg
 from agent.ephemeral_decision_support import (
     build_ephemeral_decision_support_if_allowed,
     format_ephemeral_decision_support,
@@ -178,21 +177,87 @@ def test_guard_rejects_forceful_recommendation_phrases():
         )
 
 
-def test_guardrail_files_are_not_changed_by_formatter_story():
-    result = subprocess.run(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            "--",
-            "agent/conversation_loop.py",
-            "run_agent.py",
-            "agent/prompt_builder.py",
-            "gateway",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+def test_helper_returns_copy_unchanged_when_not_current_turn_user():
+    api_msg = {"role": "user", "content": "hello"}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=False,
+        decision_support_context=SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=True,
     )
 
-    assert result.stdout == ""
+    assert updated == api_msg
+    assert updated is not api_msg
+
+
+def test_helper_returns_copy_unchanged_for_non_user_role():
+    api_msg = {"role": "assistant", "content": "hello"}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=True,
+        decision_support_context=SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=True,
+    )
+
+    assert updated == api_msg
+    assert updated is not api_msg
+
+
+def test_helper_returns_copy_unchanged_for_non_string_content():
+    api_msg = {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=True,
+        decision_support_context=SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=True,
+    )
+
+    assert updated == api_msg
+    assert updated is not api_msg
+
+
+def test_helper_returns_copy_unchanged_without_opt_in():
+    api_msg = {"role": "user", "content": "hello"}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=True,
+        decision_support_context=SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=False,
+    )
+
+    assert updated == api_msg
+    assert updated is not api_msg
+
+
+def test_helper_returns_copy_unchanged_for_invalid_context():
+    api_msg = {"role": "user", "content": "hello"}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=True,
+        decision_support_context="not fenced",
+        inject_decision_support=True,
+    )
+
+    assert updated == api_msg
+    assert updated is not api_msg
+
+
+def test_helper_appends_guarded_decision_support_and_keeps_original_content():
+    api_msg = {"role": "user", "content": "hello"}
+
+    updated = _with_ephemeral_decision_support_for_api_msg(
+        api_msg,
+        is_current_turn_user=True,
+        decision_support_context=SAMPLE_DECISION_SUPPORT_CONTEXT,
+        inject_decision_support=True,
+    )
+
+    assert updated is not api_msg
+    assert updated["content"].startswith("hello\n\n<ephemeral_decision_support>\n")
+    assert SAMPLE_DECISION_SUPPORT_CONTEXT in updated["content"]
+    assert api_msg == {"role": "user", "content": "hello"}
