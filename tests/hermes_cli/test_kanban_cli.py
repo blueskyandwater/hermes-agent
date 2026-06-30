@@ -566,3 +566,292 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+def _planner_task(
+    title: str,
+    *,
+    status: str = "ready",
+    body: str | None = None,
+    task_id: str = "t_test",
+) -> kb.Task:
+    return kb.Task(
+        id=task_id,
+        title=title,
+        body=body,
+        assignee=None,
+        status=status,
+        priority=0,
+        created_by="test",
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "task,gate_open,expected",
+    [
+        (_planner_task("[Backlog] idea"), False, "backlog-never-run"),
+        (_planner_task("[Planning] design doc"), False, "ready-for-design"),
+        (_planner_task("[High-Risk] touch runtime"), False, "high-risk-needs-human"),
+        (_planner_task("No prefix card"), False, "not-ready"),
+        (
+            _planner_task(
+                "[Implementation] build planner",
+                body="mode: implementation-no-commit",
+            ),
+            False,
+            "blocked-by-gate",
+        ),
+    ],
+)
+def test_classify_planner_task_minimal_rules(task, gate_open, expected):
+    row = kc._classify_planner_task(task, gate_open=gate_open)
+    assert row["classification"] == expected
+
+
+def test_planner_report_adds_ready_for_push_candidate_when_ahead():
+    report = kc._planner_report(
+        [],
+        board="hermes-product",
+        gate_open=False,
+        git_summary={
+            "workdir": "/repo",
+            "branch": "main",
+            "ahead_count": 2,
+            "dirty_worktree": False,
+            "status_summary": "clean",
+            "errors": [],
+        },
+    )
+    assert report["candidates"][0]["classification"] == "ready-for-push"
+    assert report["candidates"][0]["required_mode"] == "push-only"
+
+
+def test_planner_report_adds_ready_for_review_commit_candidate_when_dirty():
+    report = kc._planner_report(
+        [],
+        board="hermes-product",
+        gate_open=False,
+        git_summary={
+            "workdir": "/repo",
+            "branch": "main",
+            "ahead_count": 0,
+            "dirty_worktree": True,
+            "status_summary": "dirty (1 path)",
+            "errors": [],
+        },
+    )
+    assert report["candidates"][0]["classification"] == "ready-for-review-commit"
+    assert report["candidates"][0]["risk_level"] == "medium"
+
+
+def test_planner_report_returns_zero_candidates_without_ready_running_or_git_signal():
+    report = kc._planner_report(
+        [_planner_task("[Planning] draft", status="todo")],
+        board="hermes-product",
+        gate_open=False,
+        git_summary={
+            "workdir": "/repo",
+            "branch": "main",
+            "ahead_count": 0,
+            "dirty_worktree": False,
+            "status_summary": "clean",
+            "errors": [],
+        },
+    )
+    assert report["candidates"] == []
+
+
+def test_classify_planner_task_done_uses_needs_close_evidence():
+    row = kc._classify_planner_task(
+        _planner_task("[Implementation] shipped", status="done", body="mode: implementation-no-commit"),
+        gate_open=False,
+    )
+    assert row["classification"] == "needs-close-evidence"
+    assert row["blocked_reason"] == "done state alone is not proof of artifact / commit / push evidence"
+
+
+def test_run_slash_planner_output_contains_required_sections(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        kc,
+        "_planner_git_summary",
+        lambda **kwargs: {
+            "workdir": kwargs["workdir"],
+            "branch": "main",
+            "ahead_count": 0,
+            "dirty_worktree": False,
+            "status_summary": "clean",
+            "errors": [],
+        },
+    )
+    out = kc.run_slash("planner")
+    assert "board summary:" in out
+    assert "candidate ranking:" in out
+    assert "must-not-run list:" in out
+
+
+def test_run_slash_planner_does_not_call_kanban_mutation_functions(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        kc,
+        "_planner_git_summary",
+        lambda **kwargs: {
+            "workdir": kwargs["workdir"],
+            "branch": "main",
+            "ahead_count": 0,
+            "dirty_worktree": False,
+            "status_summary": "clean",
+            "errors": [],
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "create_task", _boom)
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    out = kc.run_slash("planner")
+    assert "mode: planner-read-only" in out
+
+
+def test_run_slash_planner_json_schema_is_stable(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        kc,
+        "_planner_git_summary",
+        lambda **kwargs: {
+            "workdir": kwargs["workdir"],
+            "branch": "main",
+            "ahead_count": 2,
+            "dirty_worktree": True,
+            "status_summary": "dirty (1 path)",
+            "git_available": True,
+            "errors": [],
+        },
+    )
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Implementation] planner json",
+            body="mode: implementation-no-commit",
+            created_by="test",
+        )
+
+    raw = kc.run_slash("planner --json")
+    data = json.loads(raw)
+
+    assert data["schema_version"] == "planner.v1"
+    assert data["mode"] == "planner-read-only"
+    assert set(data.keys()) >= {
+        "schema_version",
+        "mode",
+        "board_summary",
+        "git_summary",
+        "gate_assumption",
+        "candidates",
+        "classification",
+        "must_not_run",
+        "notes",
+    }
+    assert data["board_summary"]["board"] == kb.get_current_board()
+    assert data["git_summary"]["ahead_count"] == 2
+    assert data["git_summary"]["dirty_worktree"] is True
+    assert [row["task_id"] for row in data["candidates"][:2]] == ["git:ahead", "git:dirty"]
+    assert all(
+        set(row.keys()) >= {
+            "task_id",
+            "title",
+            "status",
+            "classification",
+            "required_mode",
+            "risk_level",
+            "reason",
+            "blocked_reason",
+            "next_human_approval",
+        }
+        for row in data["candidates"]
+    )
+    assert any(
+        set(row.keys()) >= {
+            "task_id",
+            "title",
+            "status",
+            "prefix",
+            "mode",
+            "classification",
+            "required_mode",
+            "risk_level",
+            "reason",
+            "blocked_reason",
+            "next_human_approval",
+            "candidate",
+        }
+        for row in data["classification"]
+    )
+    assert "Planner is read-only: no Kanban mutation, no Git mutation, no file edits" in data["must_not_run"]
+
+
+def test_planner_report_docstring_describes_planner_v1_contract():
+    doc = kc._planner_report.__doc__ or ""
+    assert 'schema_version is always "planner.v1"' in doc
+    assert "canonical keys are mode, board_summary, git_summary, gate_assumption," in doc
+    assert "candidates, classification, must_not_run, and notes" in doc
+    assert "candidates is the ranked first-look list for dispatcher/watchdog readers" in doc
+    assert "classification is the full-task audit list" in doc
+    assert "git_summary contains read-only git signals only" in doc
+    assert "gate_assumption is an operator assumption, not runtime truth" in doc
+    assert "planner does not perform Kanban mutation, Git mutation, or dispatcher dispatch" in doc
+
+
+def test_require_planner_v1_accepts_planner_v1_report():
+    report = {"schema_version": "planner.v1", "mode": "planner-read-only"}
+    assert kc._require_planner_v1(report) is report
+
+
+@pytest.mark.parametrize("report", [{}, {"schema_version": None}, {"schema_version": "planner.v0"}, {"schema_version": "unexpected"}])
+def test_require_planner_v1_rejects_missing_or_unknown_schema(report):
+    with pytest.raises(ValueError, match="planner report schema mismatch"):
+        kc._require_planner_v1(report)
+
+
+
+def test_planner_git_summary_uses_read_only_git_commands_only(monkeypatch, tmp_path):
+    seen: list[list[str]] = []
+
+    class _CP:
+        def __init__(self, args, stdout="", stderr="", returncode=0):
+            self.args = args
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, **kwargs):
+        seen.append(list(cmd))
+        assert cmd[:2] in (
+            ["git", "status"],
+            ["git", "branch"],
+            ["git", "rev-list"],
+        )
+        assert all(part not in {"add", "commit", "push", "reset", "checkout", "merge", "rebase"} for part in cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _CP(cmd, stdout="")
+        if cmd[:2] == ["git", "branch"]:
+            return _CP(cmd, stdout="main\n")
+        return _CP(cmd, stdout="0\n")
+
+    monkeypatch.setattr(kc.subprocess, "run", fake_run)
+    summary = kc._planner_git_summary(workdir=str(tmp_path))
+    assert summary["branch"] == "main"
+    assert summary["ahead_count"] == 0
+    assert summary["dirty_worktree"] is False
+    assert len(seen) == 3

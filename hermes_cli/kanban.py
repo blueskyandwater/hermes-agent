@@ -18,9 +18,12 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
+import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
@@ -90,6 +93,350 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     if st is None:
         return {}
     return {"state_type": st, "state_name": sn}
+
+
+def _planner_title_prefix(title: str) -> Optional[str]:
+    match = re.match(r"^\s*\[([^\]]+)\]", title or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower()
+
+
+def _planner_extract_mode(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(r"(?mi)^\s*mode\s*:\s*([a-z0-9._-]+)\s*$", text)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _planner_risk_level(classification: str) -> str:
+    if classification == "high-risk-needs-human":
+        return "high"
+    if classification in {"blocked-by-gate", "ready-for-push", "ready-for-review-commit"}:
+        return "medium"
+    return "low"
+
+
+def _planner_candidate_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": row["task_id"],
+        "title": row["title"],
+        "status": row["status"],
+        "classification": row["classification"],
+        "required_mode": row["required_mode"],
+        "risk_level": row["risk_level"],
+        "reason": row["reason"],
+        "blocked_reason": row["blocked_reason"],
+        "next_human_approval": row["next_human_approval"],
+    }
+
+
+def _classify_planner_task(task: kb.Task, *, gate_open: bool) -> dict[str, Any]:
+    prefix = _planner_title_prefix(task.title)
+    mode = _planner_extract_mode(task.body)
+    status = task.status
+    blocked_reason = "N/A"
+    next_human_approval = "N/A"
+    reason = f"status={status}"
+
+    if prefix == "backlog":
+        classification = "backlog-never-run"
+        blocked_reason = "[Backlog] cards are inventory and must never auto-run"
+        next_human_approval = "Human must explicitly rewrite this into a scoped non-backlog task"
+    elif prefix == "high-risk":
+        classification = "high-risk-needs-human"
+        blocked_reason = "[High-Risk] work requires explicit human approval before any mutation"
+        next_human_approval = "Approve the exact allowed files, mode, and risk boundary"
+    elif status == "done":
+        classification = "needs-close-evidence"
+        blocked_reason = "done state alone is not proof of artifact / commit / push evidence"
+        next_human_approval = "Verify artifact, tests, commit, and push evidence before close"
+    elif prefix is None:
+        classification = "not-ready"
+        blocked_reason = "missing title prefix; no-prefix cards are not automatic execution targets"
+        next_human_approval = "Assign a prefix and explicit mode before execution"
+    elif prefix == "planning":
+        if mode == "design-doc-commit-only":
+            classification = "ready-for-design-doc"
+            reason = "[Planning] with explicit docs-only mode is design-doc scoped"
+        else:
+            classification = "ready-for-design"
+            reason = "[Planning] cards are limited to read-only / design work"
+        next_human_approval = "Approve the exact design/doc scope before mutation"
+    else:
+        mode_map = {
+            "design-doc-commit-only": "ready-for-design-doc",
+            "implementation-no-commit": "ready-for-implementation-no-commit",
+            "implementation-review-commit": "ready-for-review-commit",
+            "push-only": "ready-for-push",
+            "kanban-sync-only": "ready-for-kanban-sync",
+        }
+        if not mode:
+            classification = "not-ready"
+            blocked_reason = "implementation-style work needs an explicit mode"
+            next_human_approval = "Add an explicit mode before execution"
+        elif not gate_open and mode.startswith("implementation"):
+            classification = "blocked-by-gate"
+            blocked_reason = "Planning Gate assumption is closed for implementation work"
+            next_human_approval = "Open the gate or keep this in planning"
+        else:
+            classification = mode_map.get(mode, "not-ready")
+            if classification == "not-ready":
+                blocked_reason = f"unknown or unsupported mode: {mode}"
+                next_human_approval = "Clarify the intended mode before execution"
+            else:
+                reason = f"explicit mode={mode}"
+                if classification == "ready-for-push":
+                    next_human_approval = "Approve `git push origin main` after scope review"
+                elif classification == "ready-for-review-commit":
+                    next_human_approval = "Review the diff before any staging or commit"
+                elif classification == "ready-for-kanban-sync":
+                    next_human_approval = "Verify artifact / git / push reality before sync"
+                else:
+                    next_human_approval = "Approve the bounded execution scope"
+
+    candidate = status in {"ready", "running"} and classification in {
+        "ready-for-design",
+        "ready-for-design-doc",
+        "ready-for-implementation-no-commit",
+        "ready-for-review-commit",
+        "ready-for-push",
+        "ready-for-kanban-sync",
+    }
+    if status not in {"ready", "running"}:
+        candidate = False
+        if blocked_reason == "N/A":
+            blocked_reason = f"status={status} is not a ready/running candidate"
+
+    return {
+        "task_id": task.id,
+        "title": task.title,
+        "status": status,
+        "prefix": prefix,
+        "mode": mode,
+        "classification": classification,
+        "required_mode": mode or "N/A",
+        "risk_level": _planner_risk_level(classification),
+        "reason": reason,
+        "blocked_reason": blocked_reason,
+        "next_human_approval": next_human_approval,
+        "candidate": candidate,
+    }
+
+
+def _planner_git_summary(*, workdir: str) -> dict[str, Any]:
+    def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    summary: dict[str, Any] = {
+        "workdir": workdir,
+        "branch": "N/A",
+        "ahead_count": 0,
+        "dirty_worktree": False,
+        "status_summary": "unknown",
+        "git_available": False,
+        "errors": [],
+    }
+    try:
+        status = _run_git(["status", "--short"])
+        branch = _run_git(["branch", "--show-current"])
+        ahead = _run_git(["rev-list", "--count", "origin/main..HEAD"])
+    except OSError as exc:
+        summary["errors"].append(str(exc))
+        summary["status_summary"] = f"git unavailable: {exc}"
+        return summary
+
+    summary["git_available"] = True
+    dirty_lines = [line for line in status.stdout.splitlines() if line.strip()]
+    summary["dirty_worktree"] = bool(dirty_lines)
+    summary["status_summary"] = "clean" if not dirty_lines else f"dirty ({len(dirty_lines)} path(s))"
+    if status.returncode != 0 and status.stderr.strip():
+        summary["errors"].append(status.stderr.strip())
+        summary["status_summary"] = status.stderr.strip()
+
+    if branch.returncode == 0 and branch.stdout.strip():
+        summary["branch"] = branch.stdout.strip()
+    elif branch.stderr.strip():
+        summary["errors"].append(branch.stderr.strip())
+
+    if ahead.returncode == 0:
+        try:
+            summary["ahead_count"] = int((ahead.stdout or "0").strip() or "0")
+        except ValueError:
+            summary["errors"].append(f"unexpected ahead count: {ahead.stdout!r}")
+    elif ahead.stderr.strip():
+        summary["errors"].append(ahead.stderr.strip())
+
+    return summary
+
+
+def _planner_report(
+    tasks: list[kb.Task],
+    *,
+    board: str,
+    gate_open: bool,
+    git_summary: dict[str, Any],
+    candidate_limit: int = 3,
+) -> dict[str, Any]:
+    """Build the canonical planner.v1 report for read-only consumers.
+
+    Contract source of truth:
+    - schema_version is always "planner.v1"
+    - canonical keys are mode, board_summary, git_summary, gate_assumption,
+      candidates, classification, must_not_run, and notes
+    - candidates is the ranked first-look list for dispatcher/watchdog readers
+    - classification is the full-task audit list
+    - git_summary contains read-only git signals only
+    - gate_assumption is an operator assumption, not runtime truth
+    - planner does not perform Kanban mutation, Git mutation, or dispatcher dispatch
+    """
+    counts = Counter(task.status for task in tasks)
+    classified = [_classify_planner_task(task, gate_open=gate_open) for task in tasks]
+    no_prefix = sum(1 for row in classified if row["prefix"] is None)
+
+    candidates: list[dict[str, Any]] = []
+    ahead_count = int(git_summary.get("ahead_count") or 0)
+    if ahead_count > 0:
+        candidates.append({
+            "task_id": "git:ahead",
+            "title": "Git ahead of origin/main",
+            "status": "N/A",
+            "classification": "ready-for-push",
+            "required_mode": "push-only",
+            "risk_level": "medium",
+            "reason": f"origin/main..HEAD = {ahead_count}",
+            "blocked_reason": "N/A",
+            "next_human_approval": "Approve `git push origin main` after reviewing HEAD scope",
+        })
+    if git_summary.get("dirty_worktree"):
+        candidates.append({
+            "task_id": "git:dirty",
+            "title": "Git dirty worktree",
+            "status": "N/A",
+            "classification": "ready-for-review-commit",
+            "required_mode": "implementation-review-commit",
+            "risk_level": "medium",
+            "reason": "worktree has uncommitted changes",
+            "blocked_reason": "diff inspection is required before staging or commit",
+            "next_human_approval": "Review the dirty diff and approve the exact commit scope",
+        })
+    for row in classified:
+        if row["candidate"]:
+            candidates.append(_planner_candidate_view(row))
+
+    must_not_run = [
+        "[Backlog] cards are backlog-never-run",
+        "[High-Risk] cards require explicit human approval",
+        "No-prefix cards are not automatic execution targets",
+        "Planner is read-only: no Kanban mutation, no Git mutation, no file edits",
+    ]
+    if not gate_open:
+        must_not_run.append("Implementation work is blocked while the Planning Gate assumption is closed")
+
+    notes = []
+    if no_prefix:
+        notes.append(f"no-prefix cards: {no_prefix}")
+    done_without_evidence = sum(1 for row in classified if row["classification"] == "needs-close-evidence")
+    if done_without_evidence:
+        notes.append(f"done-but-unverified cards: {done_without_evidence}")
+    if git_summary.get("errors"):
+        notes.append("git notes: " + " | ".join(str(x) for x in git_summary["errors"]))
+    if not candidates:
+        notes.append("safe candidate count is zero; returning N/A is valid")
+
+    limited_candidates = candidates[:candidate_limit]
+    return {
+        "schema_version": "planner.v1",
+        "mode": "planner-read-only",
+        "board_summary": {
+            "board": board,
+            "total_cards": len(tasks),
+            "by_status": dict(sorted(counts.items())),
+            "ready_count": counts.get("ready", 0),
+            "running_count": counts.get("running", 0),
+            "blocked_count": counts.get("blocked", 0),
+            "no_prefix_count": no_prefix,
+        },
+        "git_summary": git_summary,
+        "gate_assumption": "open" if gate_open else "closed",
+        "candidates": limited_candidates,
+        "classification": classified,
+        "must_not_run": must_not_run,
+        "notes": notes,
+        # Back-compat aliases for current human-readable formatter / external callers.
+        "git_status": git_summary,
+        "candidate_ranking": limited_candidates,
+        "must_not_run_list": must_not_run,
+    }
+
+
+def _require_planner_v1(report: dict[str, Any]) -> dict[str, Any]:
+    """Reject planner reports that do not match the canonical planner.v1 schema."""
+    schema_version = report.get("schema_version")
+    if schema_version != "planner.v1":
+        raise ValueError(
+            "planner report schema mismatch: expected schema_version='planner.v1' "
+            f"but got {schema_version!r}"
+        )
+    return report
+
+
+def _format_planner_report(report: dict[str, Any]) -> str:
+    report = _require_planner_v1(report)
+    board = report["board_summary"]
+    git = report.get("git_summary") or report["git_status"]
+    lines = [
+        f"mode: {report['mode']}",
+        "",
+        "board summary:",
+        f"- board: {board['board']}",
+        f"- total cards: {board['total_cards']}",
+        f"- by status: {board['by_status'] or 'N/A'}",
+        f"- ready/running/review: ready={board['ready_count']}, running={board['running_count']}, reviewable_git={'yes' if git.get('dirty_worktree') else 'no'}",
+        f"- blocked: {board['blocked_count']}",
+        f"- no-prefix: {board['no_prefix_count']}",
+        "",
+        "git status:",
+        f"- workdir: {git.get('workdir', 'N/A')}",
+        f"- branch: {git.get('branch', 'N/A')}",
+        f"- ahead count: {git.get('ahead_count', 'N/A')}",
+        f"- dirty worktree: {'yes' if git.get('dirty_worktree') else 'no'}",
+        f"- status summary: {git.get('status_summary', 'N/A')}",
+        "",
+        "gate assumption:",
+        f"- {report['gate_assumption']} (conservative unless explicitly overridden)",
+        "",
+        "candidate ranking:",
+    ]
+    candidates = report.get("candidates") or report.get("candidate_ranking") or []
+    if not candidates:
+        lines.append("N/A")
+    else:
+        for idx, candidate in enumerate(candidates, start=1):
+            lines.extend([
+                f"{idx}. {candidate['task_id']} - {candidate['title']}",
+                f"   - classification: {candidate['classification']}",
+                f"   - required mode: {candidate['required_mode']}",
+                f"   - risk level: {candidate['risk_level']}",
+                f"   - reason: {candidate['reason']}",
+                f"   - blocked reason: {candidate['blocked_reason']}",
+                f"   - next human approval: {candidate['next_human_approval']}",
+            ])
+    lines.extend(["", "must-not-run list:"])
+    for item in report.get("must_not_run") or report.get("must_not_run_list") or ["N/A"]:
+        lines.append(f"- {item}")
+    lines.extend(["", "notes:"])
+    for item in report.get("notes") or ["N/A"]:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
 
 
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
@@ -416,6 +763,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="current_step_key",
         metavar="KEY",
         help="Restrict to tasks with this current_step_key",
+    )
+
+    # --- planner ---
+    p_planner = sub.add_parser(
+        "planner",
+        help="Read-only board/git planner: classify next-step candidates without mutation",
+    )
+    p_planner.add_argument("--json", action="store_true")
+    p_planner.add_argument(
+        "--gate-assumption",
+        choices=("closed", "open"),
+        default="closed",
+        help="Planning Gate assumption for implementation classification (default: closed)",
+    )
+    p_planner.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Maximum number of ranked candidates to emit (default: 3)",
     )
 
     # --- show ---
@@ -926,6 +1292,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
+            "planner":  _cmd_planner,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
@@ -1440,6 +1807,31 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
+    return 0
+
+
+def _cmd_planner(args: argparse.Namespace) -> int:
+    board = kb.get_current_board()
+    meta = kb.read_board_metadata(board)
+    workdir = meta.get("default_workdir") or os.getcwd()
+    gate_open = getattr(args, "gate_assumption", "closed") == "open"
+    limit = max(0, int(getattr(args, "limit", 3) or 0))
+
+    with kb.connect_closing() as conn:
+        tasks = kb.list_tasks(conn, include_archived=False, limit=1000)
+
+    git_summary = _planner_git_summary(workdir=workdir)
+    report = _planner_report(
+        tasks,
+        board=board,
+        gate_open=gate_open,
+        git_summary=git_summary,
+        candidate_limit=limit,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    print(_format_planner_report(report))
     return 0
 
 
