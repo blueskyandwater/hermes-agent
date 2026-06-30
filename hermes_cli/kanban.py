@@ -671,6 +671,49 @@ def _planner_consumer_preview(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pre_gate_preview(
+    report: dict[str, Any],
+    *,
+    runtime_mode: str,
+    human_approval: bool,
+) -> dict[str, Any]:
+    """Read-only preview of dispatcher pre-gate selection for planner.v1.
+
+    This only evaluates planner candidates. It never mutates Kanban, mutates
+    Git, dispatches work, starts workers, or changes task status.
+    """
+    report = _require_planner_dispatch_input(report)
+    decision = _select_dispatchable_candidate(
+        report,
+        runtime_mode=runtime_mode,
+        human_approval=human_approval,
+    )
+    display_decision = decision
+    evaluated = [
+        {k: v for k, v in item.items() if k != "evaluated_candidates"}
+        for item in (decision.get("evaluated_candidates") or [])
+    ]
+    if decision.get("reason_code") == "safe-noop-no-candidates" and evaluated:
+        display_decision = evaluated[0]
+    return {
+        "schema_version": "pre-gate-preview.v1",
+        "source_schema_version": report["schema_version"],
+        "runtime_mode": runtime_mode,
+        "human_approval": human_approval,
+        "gate_assumption": report.get("gate_assumption", "unknown"),
+        "decision": display_decision["decision"],
+        "allowed": display_decision["allowed"],
+        "reason_code": display_decision["reason_code"],
+        "reason_text": display_decision["reason_text"],
+        "candidate_task_id": display_decision["candidate_task_id"],
+        "classification": display_decision["classification"],
+        "required_mode": display_decision["required_mode"],
+        "risk_level": display_decision["risk_level"],
+        "evaluated_candidates": evaluated,
+        "must_not_run": list(report.get("must_not_run") or []),
+    }
+
+
 def _format_planner_consumer_preview(preview: dict[str, Any]) -> str:
     lines = [
         f"mode: {preview['mode']}",
@@ -695,6 +738,30 @@ def _format_planner_consumer_preview(preview: dict[str, Any]) -> str:
             f"- next_human_approval: {candidate['next_human_approval']}",
         ])
     lines.extend(["", "must-not-run list:"])
+    for item in preview.get("must_not_run") or ["N/A"]:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def _format_pre_gate_preview(preview: dict[str, Any]) -> str:
+    lines = [
+        f"schema_version: {preview['schema_version']}",
+        f"source_schema_version: {preview['source_schema_version']}",
+        f"runtime_mode: {preview['runtime_mode']}",
+        f"human_approval: {'true' if preview['human_approval'] else 'false'}",
+        f"gate_assumption: {preview['gate_assumption']}",
+        f"decision: {preview['decision']}",
+        f"allowed: {'true' if preview['allowed'] else 'false'}",
+        f"reason_code: {preview['reason_code']}",
+        f"reason_text: {preview['reason_text']}",
+        f"candidate_task_id: {preview['candidate_task_id']}",
+        f"classification: {preview['classification']}",
+        f"required_mode: {preview['required_mode']}",
+        f"risk_level: {preview['risk_level']}",
+        f"evaluated_candidates: {len(preview.get('evaluated_candidates') or [])}",
+        "",
+        "must-not-run list:",
+    ]
     for item in preview.get("must_not_run") or ["N/A"]:
         lines.append(f"- {item}")
     return "\n".join(lines)
@@ -1112,6 +1179,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         type=int,
         default=3,
         help="Maximum number of planner candidates to read before previewing the first (default: 3)",
+    )
+
+    # --- pre-gate-preview ---
+    p_pre_gate_preview = sub.add_parser(
+        "pre-gate-preview",
+        help="Read-only preview of planner.v1 through dispatcher pre-gate selection",
+    )
+    p_pre_gate_preview.add_argument("--json", action="store_true")
+    p_pre_gate_preview.add_argument(
+        "--gate-assumption",
+        choices=("closed", "open"),
+        default="closed",
+        help="Planning Gate assumption for implementation classification (default: closed)",
+    )
+    p_pre_gate_preview.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Maximum number of planner candidates to evaluate (default: 3)",
+    )
+    p_pre_gate_preview.add_argument(
+        "--runtime-mode",
+        required=True,
+        help="Runtime mode to evaluate, e.g. design-no-commit or implementation-no-commit",
+    )
+    p_pre_gate_preview.add_argument(
+        "--human-approval",
+        action="store_true",
+        help="Simulate explicit human approval for review/push pre-gate checks",
     )
 
     # --- show ---
@@ -1624,6 +1720,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "planner":  _cmd_planner,
             "planner-preview": _cmd_planner_preview,
+            "pre-gate-preview": _cmd_pre_gate_preview,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
@@ -2141,24 +2238,28 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_planner(args: argparse.Namespace) -> int:
+def _planner_report_from_current_board(*, gate_open: bool, limit: int) -> dict[str, Any]:
     board = kb.get_current_board()
     meta = kb.read_board_metadata(board)
     workdir = meta.get("default_workdir") or os.getcwd()
-    gate_open = getattr(args, "gate_assumption", "closed") == "open"
-    limit = max(0, int(getattr(args, "limit", 3) or 0))
 
     with kb.connect_closing() as conn:
         tasks = kb.list_tasks(conn, include_archived=False, limit=1000)
 
-    git_summary = _planner_git_summary(workdir=workdir)
-    report = _planner_report(
+    return _planner_report(
         tasks,
         board=board,
         gate_open=gate_open,
-        git_summary=git_summary,
+        git_summary=_planner_git_summary(workdir=workdir),
         candidate_limit=limit,
     )
+
+
+def _cmd_planner(args: argparse.Namespace) -> int:
+    gate_open = getattr(args, "gate_assumption", "closed") == "open"
+    limit = max(0, int(getattr(args, "limit", 3) or 0))
+
+    report = _planner_report_from_current_board(gate_open=gate_open, limit=limit)
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
@@ -2167,27 +2268,32 @@ def _cmd_planner(args: argparse.Namespace) -> int:
 
 
 def _cmd_planner_preview(args: argparse.Namespace) -> int:
-    board = kb.get_current_board()
-    meta = kb.read_board_metadata(board)
-    workdir = meta.get("default_workdir") or os.getcwd()
     gate_open = getattr(args, "gate_assumption", "closed") == "open"
     limit = max(0, int(getattr(args, "limit", 3) or 0))
 
-    with kb.connect_closing() as conn:
-        tasks = kb.list_tasks(conn, include_archived=False, limit=1000)
-
-    report = _planner_report(
-        tasks,
-        board=board,
-        gate_open=gate_open,
-        git_summary=_planner_git_summary(workdir=workdir),
-        candidate_limit=limit,
-    )
+    report = _planner_report_from_current_board(gate_open=gate_open, limit=limit)
     preview = _planner_consumer_preview(report)
     if getattr(args, "json", False):
         print(json.dumps(preview, indent=2, ensure_ascii=False))
         return 0
     print(_format_planner_consumer_preview(preview))
+    return 0
+
+
+def _cmd_pre_gate_preview(args: argparse.Namespace) -> int:
+    gate_open = getattr(args, "gate_assumption", "closed") == "open"
+    limit = max(0, int(getattr(args, "limit", 3) or 0))
+
+    report = _planner_report_from_current_board(gate_open=gate_open, limit=limit)
+    preview = _pre_gate_preview(
+        report,
+        runtime_mode=str(getattr(args, "runtime_mode", "")),
+        human_approval=bool(getattr(args, "human_approval", False)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return 0
+    print(_format_pre_gate_preview(preview))
     return 0
 
 

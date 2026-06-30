@@ -1215,6 +1215,169 @@ def test_select_dispatchable_candidate_empty_candidates_is_safe_noop():
     assert decision["candidate_task_id"] == "N/A"
 
 
+def test_pre_gate_preview_reads_planner_v1_report_and_allows_matching_runtime():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task(
+                "[Implementation] build planner",
+                body="mode: implementation-no-commit",
+                task_id="t_impl",
+            )
+        ],
+    )
+
+    preview = kc._pre_gate_preview(
+        report,
+        runtime_mode="implementation-no-commit",
+        human_approval=False,
+    )
+
+    assert preview["schema_version"] == "pre-gate-preview.v1"
+    assert preview["source_schema_version"] == "planner.v1"
+    assert preview["runtime_mode"] == "implementation-no-commit"
+    assert preview["human_approval"] is False
+    assert preview["decision"] == "allow"
+    assert preview["allowed"] is True
+    assert preview["reason_code"] == "ready-for-implementation-no-commit-allowed"
+    assert preview["candidate_task_id"] == "t_impl"
+    assert preview["classification"] == "ready-for-implementation-no-commit"
+    assert preview["required_mode"] == "implementation-no-commit"
+    assert preview["risk_level"] == "low"
+
+
+def test_pre_gate_preview_runtime_mode_mismatch_rejects():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task(
+                "[Implementation] build planner",
+                body="mode: implementation-no-commit",
+                task_id="t_impl",
+            )
+        ],
+    )
+
+    preview = kc._pre_gate_preview(
+        report,
+        runtime_mode="implementation-review-commit",
+        human_approval=False,
+    )
+
+    assert preview["decision"] == "reject"
+    assert preview["allowed"] is False
+    assert preview["reason_code"] == "mode-mismatch"
+    assert preview["candidate_task_id"] == "t_impl"
+
+
+def test_pre_gate_preview_review_commit_requires_human_approval():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task(
+                "[Implementation] review",
+                body="mode: implementation-review-commit",
+                task_id="t_review",
+            )
+        ],
+    )
+
+    preview = kc._pre_gate_preview(
+        report,
+        runtime_mode="implementation-review-commit",
+        human_approval=False,
+    )
+
+    assert preview["decision"] == "needs-human"
+    assert preview["allowed"] is False
+    assert preview["reason_code"] == "human-approval-required"
+    assert preview["classification"] == "ready-for-review-commit"
+
+
+def test_pre_gate_preview_empty_candidates_is_safe_noop():
+    report = _planner_dispatch_report()
+
+    preview = kc._pre_gate_preview(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+
+    assert preview["decision"] == "reject"
+    assert preview["allowed"] is False
+    assert preview["reason_code"] == "safe-noop-no-candidates"
+    assert preview["candidate_task_id"] == "N/A"
+
+
+def test_run_slash_pre_gate_preview_json_shape(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Implementation] build planner",
+            body="mode: implementation-no-commit",
+            created_by="test",
+            initial_status="running",
+        )
+
+    raw = kc.run_slash("pre-gate-preview --runtime-mode implementation-no-commit --gate-assumption open --json")
+    data = json.loads(raw)
+
+    assert set(data.keys()) == {
+        "schema_version",
+        "source_schema_version",
+        "runtime_mode",
+        "human_approval",
+        "gate_assumption",
+        "decision",
+        "allowed",
+        "reason_code",
+        "reason_text",
+        "candidate_task_id",
+        "classification",
+        "required_mode",
+        "risk_level",
+        "evaluated_candidates",
+        "must_not_run",
+    }
+    assert data["schema_version"] == "pre-gate-preview.v1"
+    assert data["source_schema_version"] == "planner.v1"
+    assert data["runtime_mode"] == "implementation-no-commit"
+    assert data["human_approval"] is False
+    assert data["gate_assumption"] == "open"
+    assert data["classification"] == "ready-for-implementation-no-commit"
+    assert data["required_mode"] == "implementation-no-commit"
+    assert data["risk_level"] == "low"
+    assert isinstance(data["evaluated_candidates"], list)
+
+
+def test_run_slash_pre_gate_preview_does_not_call_kanban_mutation_functions(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Implementation] build planner",
+            body="mode: implementation-no-commit",
+            created_by="test",
+            initial_status="running",
+        )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    out = kc.run_slash("pre-gate-preview --runtime-mode implementation-no-commit --gate-assumption open")
+    assert "schema_version: pre-gate-preview.v1" in out
+    assert "decision: allow" in out
+    assert "allowed: true" in out
+
+
 def test_pre_gate_helpers_do_not_call_mutation_functions(monkeypatch):
     report = _planner_dispatch_report(tasks=[_planner_task("[Planning] design", task_id="t_design")])
 
