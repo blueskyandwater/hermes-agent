@@ -1563,6 +1563,36 @@ def test_run_slash_watchdog_preview_json_shape(kanban_home, monkeypatch):
 
 
 
+def test_run_slash_watchdog_preview_text_markers_with_one_candidate(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Planning] draft observer",
+            created_by="test",
+            initial_status="running",
+        )
+
+    out = kc.run_slash("watchdog-preview --runtime-mode design-no-commit --gate-assumption open")
+
+    for marker in (
+        "watchdog preview:",
+        "selected_candidate:",
+        "runtime_mode:",
+        "decision:",
+        "reason_code:",
+        "required_mode:",
+        "risk_level:",
+        "next_human_approval:",
+        "safe_noop:",
+        "repo_state_hint:",
+    ):
+        assert marker in out
+    assert "decision: allow" in out
+
+
+
 def test_run_slash_watchdog_preview_does_not_call_kanban_mutation_functions(kanban_home, monkeypatch):
     monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
 
@@ -1583,5 +1613,5 @@ def test_run_slash_watchdog_preview_does_not_call_kanban_mutation_functions(kanb
     monkeypatch.setattr(kb, "unblock_task", _boom)
 
     out = kc.run_slash("watchdog-preview --runtime-mode design-no-commit --gate-assumption open")
-    assert "watchdog observer:" in out
+    assert "watchdog preview:" in out
     assert "decision: allow" in out

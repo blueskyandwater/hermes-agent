@@ -836,7 +836,7 @@ def _format_pre_gate_preview(preview: dict[str, Any]) -> str:
 
 
 def _format_watchdog_observer_summary(summary: dict[str, Any]) -> str:
-    lines = ["watchdog observer:"]
+    lines = ["watchdog preview:"]
     candidate = summary.get("selected_candidate")
     if candidate is None:
         lines.append("selected_candidate: N/A")
