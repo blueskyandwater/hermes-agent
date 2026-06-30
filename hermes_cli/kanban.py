@@ -714,6 +714,74 @@ def _pre_gate_preview(
     }
 
 
+def _watchdog_repo_state_hint(git_summary: dict[str, Any]) -> str:
+    dirty = bool(git_summary.get("dirty_worktree"))
+    ahead_count = int(git_summary.get("ahead_count") or 0)
+    hints: list[str] = []
+    if dirty:
+        hints.append("dirty")
+    if ahead_count > 0:
+        hints.append(f"ahead:{ahead_count}")
+    if not hints:
+        return "clean"
+    return ", ".join(hints)
+
+
+def _watchdog_observer_summary(
+    report: dict[str, Any],
+    *,
+    runtime_mode: str,
+    human_approval: bool,
+) -> dict[str, Any]:
+    """Read-only watchdog observer summary for one planner-selected candidate.
+
+    This is a pure preview aggregator. It consumes planner.v1 and pre-gate-style
+    candidate evaluation only to help a human approve or reject the next step.
+    It never dispatches work, starts workers, mutates Kanban, mutates Git, or
+    changes task status.
+    """
+    report = _require_planner_v1(report)
+    planner_preview = _planner_consumer_preview(report)
+    selected = planner_preview.get("selected_candidate")
+    selected_candidate = dict(selected) if isinstance(selected, dict) else None
+    repo_state_hint = _watchdog_repo_state_hint(dict(report.get("git_summary") or {}))
+    gate_assumption = str(report.get("gate_assumption", "unknown"))
+
+    if selected_candidate is None:
+        decision = _pre_gate_decision(
+            allowed=False,
+            decision="reject",
+            reason_code="safe-noop-no-candidates",
+            reason_text="no planner candidate selected; safe no-op",
+            candidate_task_id="N/A",
+            runtime_mode=runtime_mode,
+            required_mode="N/A",
+            classification="N/A",
+            risk_level="N/A",
+        )
+        next_human_approval = "N/A"
+    else:
+        decision = _pre_gate_decision_for_candidate(
+            selected_candidate,
+            gate_assumption=gate_assumption,
+            runtime_mode=runtime_mode,
+            human_approval=human_approval,
+        )
+        next_human_approval = str(selected_candidate.get("next_human_approval", "N/A"))
+
+    return {
+        "selected_candidate": selected_candidate,
+        "runtime_mode": runtime_mode,
+        "decision": decision["decision"],
+        "reason_code": decision["reason_code"],
+        "required_mode": decision["required_mode"],
+        "risk_level": decision["risk_level"],
+        "next_human_approval": next_human_approval,
+        "safe_noop": decision["decision"] != "allow",
+        "repo_state_hint": repo_state_hint,
+    }
+
+
 def _format_planner_consumer_preview(preview: dict[str, Any]) -> str:
     lines = [
         f"mode: {preview['mode']}",
@@ -764,6 +832,31 @@ def _format_pre_gate_preview(preview: dict[str, Any]) -> str:
     ]
     for item in preview.get("must_not_run") or ["N/A"]:
         lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def _format_watchdog_observer_summary(summary: dict[str, Any]) -> str:
+    lines = ["watchdog observer:"]
+    candidate = summary.get("selected_candidate")
+    if candidate is None:
+        lines.append("selected_candidate: N/A")
+    else:
+        lines.extend([
+            "selected_candidate:",
+            f"- task_id: {candidate.get('task_id', 'N/A')}",
+            f"- title: {candidate.get('title', 'N/A')}",
+            f"- classification: {candidate.get('classification', 'N/A')}",
+        ])
+    lines.extend([
+        f"runtime_mode: {summary['runtime_mode']}",
+        f"decision: {summary['decision']}",
+        f"reason_code: {summary['reason_code']}",
+        f"required_mode: {summary['required_mode']}",
+        f"risk_level: {summary['risk_level']}",
+        f"next_human_approval: {summary['next_human_approval']}",
+        f"safe_noop: {'true' if summary['safe_noop'] else 'false'}",
+        f"repo_state_hint: {summary['repo_state_hint']}",
+    ])
     return "\n".join(lines)
 
 
@@ -1208,6 +1301,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--human-approval",
         action="store_true",
         help="Simulate explicit human approval for review/push pre-gate checks",
+    )
+
+    # --- watchdog-preview ---
+    p_watchdog_preview = sub.add_parser(
+        "watchdog-preview",
+        help="Read-only watchdog observer summary: planner-selected candidate + pre-gate style decision",
+    )
+    p_watchdog_preview.add_argument("--json", action="store_true")
+    p_watchdog_preview.add_argument(
+        "--gate-assumption",
+        choices=("closed", "open"),
+        default="closed",
+        help="Planning Gate assumption for implementation classification (default: closed)",
+    )
+    p_watchdog_preview.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Maximum number of planner candidates to inspect (default: 3)",
+    )
+    p_watchdog_preview.add_argument(
+        "--runtime-mode",
+        required=True,
+        help="Runtime mode to preview against, e.g. design-no-commit or push-only",
+    )
+    p_watchdog_preview.add_argument(
+        "--human-approval",
+        action="store_true",
+        help="Simulate explicit human approval for review/push candidate previews",
     )
 
     # --- show ---
@@ -1721,6 +1843,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "planner":  _cmd_planner,
             "planner-preview": _cmd_planner_preview,
             "pre-gate-preview": _cmd_pre_gate_preview,
+            "watchdog-preview": _cmd_watchdog_preview,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
@@ -2294,6 +2417,23 @@ def _cmd_pre_gate_preview(args: argparse.Namespace) -> int:
         print(json.dumps(preview, indent=2, ensure_ascii=False))
         return 0
     print(_format_pre_gate_preview(preview))
+    return 0
+
+
+def _cmd_watchdog_preview(args: argparse.Namespace) -> int:
+    gate_open = getattr(args, "gate_assumption", "closed") == "open"
+    limit = max(0, int(getattr(args, "limit", 3) or 0))
+
+    report = _planner_report_from_current_board(gate_open=gate_open, limit=limit)
+    preview = _watchdog_observer_summary(
+        report,
+        runtime_mode=str(getattr(args, "runtime_mode", "")),
+        human_approval=bool(getattr(args, "human_approval", False)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return 0
+    print(_format_watchdog_observer_summary(preview))
     return 0
 
 

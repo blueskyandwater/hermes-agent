@@ -1396,3 +1396,192 @@ def test_pre_gate_helpers_do_not_call_mutation_functions(monkeypatch):
         human_approval=False,
     )
     assert decision["decision"] == "allow"
+
+
+def test_watchdog_observer_summary_previews_safe_candidate_with_stable_shape():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task(
+                "[Implementation] build observer",
+                body="mode: implementation-no-commit",
+                task_id="t_impl",
+            )
+        ],
+    )
+
+    summary = kc._watchdog_observer_summary(
+        report,
+        runtime_mode="implementation-no-commit",
+        human_approval=False,
+    )
+
+    assert set(summary.keys()) == {
+        "selected_candidate",
+        "runtime_mode",
+        "decision",
+        "reason_code",
+        "required_mode",
+        "risk_level",
+        "next_human_approval",
+        "safe_noop",
+        "repo_state_hint",
+    }
+    assert summary["selected_candidate"]["task_id"] == "t_impl"
+    assert summary["runtime_mode"] == "implementation-no-commit"
+    assert summary["decision"] == "allow"
+    assert summary["reason_code"] == "ready-for-implementation-no-commit-allowed"
+    assert summary["required_mode"] == "implementation-no-commit"
+    assert summary["risk_level"] == "low"
+    assert summary["safe_noop"] is False
+    assert summary["repo_state_hint"] == "clean"
+
+
+
+def test_watchdog_observer_summary_empty_candidates_is_safe_noop():
+    report = _planner_dispatch_report()
+
+    summary = kc._watchdog_observer_summary(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+
+    assert summary["selected_candidate"] is None
+    assert summary["decision"] == "reject"
+    assert summary["reason_code"] == "safe-noop-no-candidates"
+    assert summary["required_mode"] == "N/A"
+    assert summary["risk_level"] == "N/A"
+    assert summary["next_human_approval"] == "N/A"
+    assert summary["safe_noop"] is True
+    assert summary["repo_state_hint"] == "clean"
+
+
+
+def test_watchdog_observer_summary_dirty_state_does_not_progress_to_execution():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task(
+                "[Implementation] build observer",
+                body="mode: implementation-no-commit",
+                task_id="t_impl",
+            )
+        ],
+        git_summary=_planner_git_summary_stub(dirty_worktree=True),
+    )
+
+    summary = kc._watchdog_observer_summary(
+        report,
+        runtime_mode="implementation-no-commit",
+        human_approval=False,
+    )
+
+    assert summary["selected_candidate"]["task_id"] == "git:dirty"
+    assert summary["decision"] == "reject"
+    assert summary["safe_noop"] is True
+    assert summary["repo_state_hint"] == "dirty"
+
+
+
+def test_watchdog_observer_summary_ahead_state_can_preview_push_candidate():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        git_summary=_planner_git_summary_stub(ahead_count=1),
+    )
+
+    summary = kc._watchdog_observer_summary(
+        report,
+        runtime_mode="push-only",
+        human_approval=True,
+    )
+
+    assert summary["selected_candidate"]["task_id"] == "git:ahead"
+    assert summary["decision"] == "allow"
+    assert summary["reason_code"] == "ready-for-push-allowed"
+    assert summary["required_mode"] == "push-only"
+    assert summary["risk_level"] == "medium"
+    assert summary["safe_noop"] is False
+    assert summary["repo_state_hint"] == "ahead:1"
+
+
+
+def test_watchdog_observer_summary_does_not_call_mutation_functions(monkeypatch):
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[_planner_task("[Planning] design", task_id="t_design")],
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "create_task", _boom)
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    summary = kc._watchdog_observer_summary(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+    assert summary["decision"] == "allow"
+
+
+
+def test_run_slash_watchdog_preview_json_shape(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub(dirty_worktree=True))
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Implementation] build observer",
+            body="mode: implementation-no-commit",
+            created_by="test",
+            initial_status="running",
+        )
+
+    raw = kc.run_slash("watchdog-preview --runtime-mode implementation-no-commit --gate-assumption open --json")
+    data = json.loads(raw)
+
+    assert set(data.keys()) == {
+        "selected_candidate",
+        "runtime_mode",
+        "decision",
+        "reason_code",
+        "required_mode",
+        "risk_level",
+        "next_human_approval",
+        "safe_noop",
+        "repo_state_hint",
+    }
+    assert data["selected_candidate"]["task_id"] == "git:dirty"
+    assert data["runtime_mode"] == "implementation-no-commit"
+    assert data["safe_noop"] is True
+    assert data["repo_state_hint"] == "dirty"
+
+
+
+def test_run_slash_watchdog_preview_does_not_call_kanban_mutation_functions(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
+
+    with kb.connect_closing() as conn:
+        kb.create_task(
+            conn,
+            title="[Planning] draft observer",
+            created_by="test",
+            initial_status="running",
+        )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    out = kc.run_slash("watchdog-preview --runtime-mode design-no-commit --gate-assumption open")
+    assert "watchdog observer:" in out
+    assert "decision: allow" in out
