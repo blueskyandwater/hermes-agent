@@ -389,6 +389,244 @@ def _require_planner_v1(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _require_planner_dispatch_input(report: dict[str, Any]) -> dict[str, Any]:
+    """Require canonical planner.v1 input for dispatcher pre-gate checks.
+
+    This is intentionally stricter than preview consumption: dispatcher pre-gate
+    decisions must read planner.v1 as the source of truth and fail closed for
+    preview or unknown schemas.
+    """
+    required_keys = {
+        "schema_version",
+        "mode",
+        "board_summary",
+        "git_summary",
+        "gate_assumption",
+        "candidates",
+        "classification",
+        "must_not_run",
+        "notes",
+    }
+    schema_version = report.get("schema_version")
+    if schema_version != "planner.v1":
+        raise ValueError(
+            "planner dispatch input schema mismatch: expected schema_version='planner.v1' "
+            f"but got {schema_version!r}"
+        )
+    missing = sorted(required_keys - set(report.keys()))
+    if missing:
+        raise ValueError(f"missing required planner dispatch keys: {', '.join(missing)}")
+    return report
+
+
+def _pre_gate_decision(
+    *,
+    allowed: bool,
+    decision: str,
+    reason_code: str,
+    reason_text: str,
+    candidate_task_id: str,
+    runtime_mode: str,
+    required_mode: str,
+    classification: str,
+    risk_level: str,
+) -> dict[str, Any]:
+    return {
+        "allowed": allowed,
+        "decision": decision,
+        "reason_code": reason_code,
+        "reason_text": reason_text,
+        "candidate_task_id": candidate_task_id,
+        "runtime_mode": runtime_mode,
+        "required_mode": required_mode,
+        "classification": classification,
+        "risk_level": risk_level,
+    }
+
+
+def _pre_gate_decision_for_candidate(
+    candidate: dict[str, Any],
+    *,
+    gate_assumption: str,
+    runtime_mode: str,
+    human_approval: bool,
+) -> dict[str, Any]:
+    """Pure dispatcher pre-gate decision for one planner.v1 candidate.
+
+    `allowed=True` means only that the candidate passes the pre-gate. This
+    helper never dispatches work, starts workers, mutates Kanban, or mutates Git.
+    """
+    candidate_task_id = str(candidate.get("task_id", "N/A"))
+    classification = str(candidate.get("classification", "N/A"))
+    required_mode = str(candidate.get("required_mode", "N/A"))
+    risk_level = str(candidate.get("risk_level", "N/A"))
+
+    def result(
+        allowed: bool,
+        decision: str,
+        reason_code: str,
+        reason_text: str,
+    ) -> dict[str, Any]:
+        return _pre_gate_decision(
+            allowed=allowed,
+            decision=decision,
+            reason_code=reason_code,
+            reason_text=reason_text,
+            candidate_task_id=candidate_task_id,
+            runtime_mode=runtime_mode,
+            required_mode=required_mode,
+            classification=classification,
+            risk_level=risk_level,
+        )
+
+    if risk_level == "high" or classification == "high-risk-needs-human":
+        return result(
+            False,
+            "reject",
+            "high-risk-never-auto-allow",
+            "high risk candidates require a narrower human-approved contract",
+        )
+
+    if classification in {"backlog-never-run", "not-ready", "blocked-by-gate", "needs-close-evidence"}:
+        return result(
+            False,
+            "reject",
+            f"classification-{classification}",
+            f"classification {classification} is not dispatchable",
+        )
+
+    mutation_like = classification in {
+        "ready-for-implementation-no-commit",
+        "ready-for-review-commit",
+        "ready-for-push",
+        "ready-for-kanban-sync",
+    }
+    if gate_assumption == "closed" and mutation_like:
+        return result(
+            False,
+            "reject",
+            "gate-closed",
+            "gate_assumption is closed for review/commit/push/implementation work",
+        )
+
+    if classification == "ready-for-design":
+        if runtime_mode.startswith("design-"):
+            return result(True, "allow", "ready-for-design-allowed", "design candidate matches a design runtime mode")
+        return result(False, "reject", "mode-mismatch", "ready-for-design requires a design runtime mode")
+
+    if classification == "ready-for-design-doc":
+        if runtime_mode == "design-doc-commit-only" and required_mode == runtime_mode:
+            return result(
+                True,
+                "allow",
+                "ready-for-design-doc-allowed",
+                "design-doc candidate matches design-doc-commit-only",
+            )
+        return result(False, "reject", "mode-mismatch", "ready-for-design-doc requires design-doc-commit-only")
+
+    if required_mode != "N/A" and runtime_mode != required_mode:
+        return result(False, "reject", "mode-mismatch", "runtime_mode must exactly match required_mode")
+
+    if classification == "ready-for-implementation-no-commit":
+        if runtime_mode == "implementation-no-commit" and required_mode == runtime_mode:
+            return result(
+                True,
+                "allow",
+                "ready-for-implementation-no-commit-allowed",
+                "implementation candidate matches implementation-no-commit with gate open",
+            )
+        return result(
+            False,
+            "reject",
+            "mode-mismatch",
+            "ready-for-implementation-no-commit requires implementation-no-commit runtime_mode",
+        )
+
+    if classification == "ready-for-kanban-sync":
+        return result(
+            False,
+            "reject",
+            "kanban-sync-unsupported",
+            "ready-for-kanban-sync execution semantics are not defined for pre-gate v1",
+        )
+
+    if classification == "ready-for-review-commit":
+        if not human_approval:
+            return result(
+                False,
+                "needs-human",
+                "human-approval-required",
+                "ready-for-review-commit requires explicit human approval",
+            )
+        return result(
+            True,
+            "allow",
+            "ready-for-review-commit-allowed",
+            "review/commit candidate passed pre-gate with human approval",
+        )
+
+    if classification == "ready-for-push":
+        if runtime_mode != "push-only":
+            return result(False, "reject", "mode-mismatch", "ready-for-push requires push-only runtime_mode")
+        if not human_approval:
+            return result(
+                False,
+                "needs-human",
+                "human-approval-required",
+                "ready-for-push requires explicit human approval",
+            )
+        return result(True, "allow", "ready-for-push-allowed", "push candidate passed pre-gate with human approval")
+
+    return result(
+        False,
+        "reject",
+        "unsupported-classification",
+        f"unsupported pre-gate classification: {classification}",
+    )
+
+
+def _select_dispatchable_candidate(
+    report: dict[str, Any],
+    *,
+    runtime_mode: str,
+    human_approval: bool,
+) -> dict[str, Any]:
+    """Return the first planner.v1 candidate that passes dispatcher pre-gate.
+
+    A needs-human result is returned immediately so automation stops before any
+    later lower-risk candidate. If no candidate can pass, return a safe no-op.
+    """
+    report = _require_planner_dispatch_input(report)
+    candidates = report.get("candidates") or []
+    gate_assumption = str(report.get("gate_assumption", "unknown"))
+    evaluated: list[dict[str, Any]] = []
+    for candidate in candidates:
+        decision = _pre_gate_decision_for_candidate(
+            candidate,
+            gate_assumption=gate_assumption,
+            runtime_mode=runtime_mode,
+            human_approval=human_approval,
+        )
+        evaluated.append(decision)
+        if decision["decision"] in {"allow", "needs-human"}:
+            decision["evaluated_candidates"] = evaluated
+            return decision
+
+    noop = _pre_gate_decision(
+        allowed=False,
+        decision="reject",
+        reason_code="safe-noop-no-candidates",
+        reason_text="no dispatchable candidate passed pre-gate; safe no-op",
+        candidate_task_id="N/A",
+        runtime_mode=runtime_mode,
+        required_mode="N/A",
+        classification="N/A",
+        risk_level="N/A",
+    )
+    noop["evaluated_candidates"] = evaluated
+    return noop
+
+
 def _planner_preview_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         "task_id": candidate.get("task_id", "N/A"),

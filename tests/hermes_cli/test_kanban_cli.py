@@ -965,3 +965,271 @@ def test_run_slash_planner_preview_json_shape(kanban_home, monkeypatch):
         "blocked_reason",
         "next_human_approval",
     }
+
+
+def _planner_dispatch_report(*, gate_open=True, tasks=None, git_summary=None):
+    return kc._planner_report(
+        tasks or [],
+        board="hermes-product",
+        gate_open=gate_open,
+        git_summary=git_summary or _planner_git_summary_stub(),
+    )
+
+
+def test_require_planner_dispatch_input_accepts_planner_v1_report():
+    report = _planner_dispatch_report()
+    assert kc._require_planner_dispatch_input(report) is report
+
+
+@pytest.mark.parametrize(
+    "report,match",
+    [
+        ({"schema_version": "planner-consumer-preview.v1"}, "planner dispatch input schema mismatch"),
+        ({"schema_version": "planner.v0"}, "planner dispatch input schema mismatch"),
+        ({"schema_version": "planner.v1"}, "missing required planner dispatch keys"),
+    ],
+)
+def test_require_planner_dispatch_input_rejects_preview_schema_mismatch_and_missing_keys(report, match):
+    with pytest.raises(ValueError, match=match):
+        kc._require_planner_dispatch_input(report)
+
+
+@pytest.mark.parametrize(
+    "candidate,gate_assumption,runtime_mode,human_approval,expected_decision,expected_allowed,expected_reason",
+    [
+        (
+            {"task_id": "design", "classification": "ready-for-design", "required_mode": "N/A", "risk_level": "low"},
+            "closed",
+            "design-no-commit",
+            False,
+            "allow",
+            True,
+            "ready-for-design-allowed",
+        ),
+        (
+            {
+                "task_id": "doc",
+                "classification": "ready-for-design-doc",
+                "required_mode": "design-doc-commit-only",
+                "risk_level": "low",
+            },
+            "closed",
+            "design-doc-commit-only",
+            False,
+            "allow",
+            True,
+            "ready-for-design-doc-allowed",
+        ),
+        (
+            {
+                "task_id": "impl",
+                "classification": "ready-for-implementation-no-commit",
+                "required_mode": "implementation-no-commit",
+                "risk_level": "low",
+            },
+            "open",
+            "implementation-no-commit",
+            False,
+            "allow",
+            True,
+            "ready-for-implementation-no-commit-allowed",
+        ),
+        (
+            {
+                "task_id": "impl",
+                "classification": "ready-for-implementation-no-commit",
+                "required_mode": "implementation-no-commit",
+                "risk_level": "low",
+            },
+            "closed",
+            "implementation-no-commit",
+            False,
+            "reject",
+            False,
+            "gate-closed",
+        ),
+        (
+            {
+                "task_id": "impl",
+                "classification": "ready-for-implementation-no-commit",
+                "required_mode": "implementation-no-commit",
+                "risk_level": "low",
+            },
+            "open",
+            "implementation-review-commit",
+            False,
+            "reject",
+            False,
+            "mode-mismatch",
+        ),
+        (
+            {
+                "task_id": "sync",
+                "classification": "ready-for-kanban-sync",
+                "required_mode": "kanban-sync-only",
+                "risk_level": "low",
+            },
+            "open",
+            "kanban-sync-only",
+            True,
+            "reject",
+            False,
+            "kanban-sync-unsupported",
+        ),
+        (
+            {
+                "task_id": "review",
+                "classification": "ready-for-review-commit",
+                "required_mode": "implementation-review-commit",
+                "risk_level": "medium",
+            },
+            "open",
+            "implementation-review-commit",
+            False,
+            "needs-human",
+            False,
+            "human-approval-required",
+        ),
+        (
+            {
+                "task_id": "review",
+                "classification": "ready-for-review-commit",
+                "required_mode": "implementation-review-commit",
+                "risk_level": "medium",
+            },
+            "closed",
+            "implementation-review-commit",
+            True,
+            "reject",
+            False,
+            "gate-closed",
+        ),
+        (
+            {
+                "task_id": "push",
+                "classification": "ready-for-push",
+                "required_mode": "push-only",
+                "risk_level": "medium",
+            },
+            "open",
+            "push-only",
+            True,
+            "allow",
+            True,
+            "ready-for-push-allowed",
+        ),
+        (
+            {
+                "task_id": "danger",
+                "classification": "high-risk-needs-human",
+                "required_mode": "N/A",
+                "risk_level": "high",
+            },
+            "open",
+            "implementation-no-commit",
+            True,
+            "reject",
+            False,
+            "high-risk-never-auto-allow",
+        ),
+    ],
+)
+def test_pre_gate_decision_for_candidate_table(
+    candidate,
+    gate_assumption,
+    runtime_mode,
+    human_approval,
+    expected_decision,
+    expected_allowed,
+    expected_reason,
+):
+    decision = kc._pre_gate_decision_for_candidate(
+        candidate,
+        gate_assumption=gate_assumption,
+        runtime_mode=runtime_mode,
+        human_approval=human_approval,
+    )
+
+    assert decision["decision"] == expected_decision
+    assert decision["allowed"] is expected_allowed
+    assert decision["reason_code"] == expected_reason
+    assert decision["candidate_task_id"] == candidate["task_id"]
+    assert decision["runtime_mode"] == runtime_mode
+    assert decision["required_mode"] == candidate["required_mode"]
+    assert decision["classification"] == candidate["classification"]
+    assert decision["risk_level"] == candidate["risk_level"]
+
+
+def test_select_dispatchable_candidate_returns_first_allowed_candidate():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task("[High-Risk] dangerous", task_id="t_high"),
+            _planner_task("[Planning] design", task_id="t_design"),
+        ],
+    )
+
+    decision = kc._select_dispatchable_candidate(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+
+    assert decision["decision"] == "allow"
+    assert decision["allowed"] is True
+    assert decision["candidate_task_id"] == "t_design"
+
+
+def test_select_dispatchable_candidate_returns_needs_human_before_later_allowed_candidate():
+    report = _planner_dispatch_report(
+        gate_open=True,
+        tasks=[
+            _planner_task("[Implementation] review", body="mode: implementation-review-commit", task_id="t_review"),
+            _planner_task("[Planning] design", task_id="t_design"),
+        ],
+    )
+
+    decision = kc._select_dispatchable_candidate(
+        report,
+        runtime_mode="implementation-review-commit",
+        human_approval=False,
+    )
+
+    assert decision["decision"] == "needs-human"
+    assert decision["allowed"] is False
+    assert decision["candidate_task_id"] == "t_review"
+
+
+def test_select_dispatchable_candidate_empty_candidates_is_safe_noop():
+    report = _planner_dispatch_report()
+
+    decision = kc._select_dispatchable_candidate(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+
+    assert decision["decision"] == "reject"
+    assert decision["allowed"] is False
+    assert decision["reason_code"] == "safe-noop-no-candidates"
+    assert decision["candidate_task_id"] == "N/A"
+
+
+def test_pre_gate_helpers_do_not_call_mutation_functions(monkeypatch):
+    report = _planner_dispatch_report(tasks=[_planner_task("[Planning] design", task_id="t_design")])
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "create_task", _boom)
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    decision = kc._select_dispatchable_candidate(
+        report,
+        runtime_mode="design-no-commit",
+        human_approval=False,
+    )
+    assert decision["decision"] == "allow"
