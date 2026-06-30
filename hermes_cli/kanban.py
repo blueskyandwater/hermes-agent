@@ -389,6 +389,79 @@ def _require_planner_v1(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _planner_preview_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": candidate.get("task_id", "N/A"),
+        "title": candidate.get("title", "N/A"),
+        "classification": candidate.get("classification", "N/A"),
+        "required_mode": candidate.get("required_mode", "N/A"),
+        "risk_level": candidate.get("risk_level", "N/A"),
+        "blocked_reason": candidate.get("blocked_reason", "N/A"),
+        "next_human_approval": candidate.get("next_human_approval", "N/A"),
+    }
+
+
+def _planner_consumer_preview(report: dict[str, Any]) -> dict[str, Any]:
+    """Read-only dispatcher/watchdog preview of a planner.v1 report.
+
+    This consumes planner JSON only for display. It never claims tasks, mutates
+    Kanban, mutates Git, starts workers, or dispatches work.
+    """
+    report = _require_planner_v1(report)
+    candidates = report.get("candidates") or []
+    gate_assumption = report.get("gate_assumption", "unknown")
+    selected = _planner_preview_candidate(candidates[0]) if candidates else None
+    safe_noop = selected is None
+    dispatch_allowed = False
+    if gate_assumption == "closed":
+        blocked_reason = "gate_assumption is closed; read-only preview cannot dispatch"
+    elif safe_noop:
+        blocked_reason = "no candidates; safe no-op preview"
+    else:
+        blocked_reason = "read-only preview only; dispatcher dispatch is not connected"
+
+    return {
+        "schema_version": "planner-consumer-preview.v1",
+        "source_schema_version": report["schema_version"],
+        "mode": "planner-consumer-preview-read-only",
+        "gate_assumption": gate_assumption,
+        "dispatch_allowed": dispatch_allowed,
+        "dispatch_blocked_reason": blocked_reason,
+        "safe_noop": safe_noop,
+        "selected_candidate": selected,
+        "must_not_run": list(report.get("must_not_run") or []),
+    }
+
+
+def _format_planner_consumer_preview(preview: dict[str, Any]) -> str:
+    lines = [
+        f"mode: {preview['mode']}",
+        f"source schema: {preview['source_schema_version']}",
+        f"gate assumption: {preview['gate_assumption']}",
+        f"dispatch allowed: {'yes' if preview['dispatch_allowed'] else 'no'}",
+        f"dispatch blocked reason: {preview['dispatch_blocked_reason']}",
+        "",
+        "selected candidate:",
+    ]
+    candidate = preview.get("selected_candidate")
+    if candidate is None:
+        lines.append("N/A (safe no-op preview)")
+    else:
+        lines.extend([
+            f"- task_id: {candidate['task_id']}",
+            f"- title: {candidate['title']}",
+            f"- classification: {candidate['classification']}",
+            f"- required_mode: {candidate['required_mode']}",
+            f"- risk_level: {candidate['risk_level']}",
+            f"- blocked_reason: {candidate['blocked_reason']}",
+            f"- next_human_approval: {candidate['next_human_approval']}",
+        ])
+    lines.extend(["", "must-not-run list:"])
+    for item in preview.get("must_not_run") or ["N/A"]:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
 def _format_planner_report(report: dict[str, Any]) -> str:
     report = _require_planner_v1(report)
     board = report["board_summary"]
@@ -782,6 +855,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         type=int,
         default=3,
         help="Maximum number of ranked candidates to emit (default: 3)",
+    )
+
+    # --- planner-preview ---
+    p_planner_preview = sub.add_parser(
+        "planner-preview",
+        help="Read-only dispatcher/watchdog preview of the planner.v1 first candidate",
+    )
+    p_planner_preview.add_argument("--json", action="store_true")
+    p_planner_preview.add_argument(
+        "--gate-assumption",
+        choices=("closed", "open"),
+        default="closed",
+        help="Planning Gate assumption for implementation classification (default: closed)",
+    )
+    p_planner_preview.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Maximum number of planner candidates to read before previewing the first (default: 3)",
     )
 
     # --- show ---
@@ -1293,6 +1385,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "list":     _cmd_list,
             "ls":       _cmd_list,
             "planner":  _cmd_planner,
+            "planner-preview": _cmd_planner_preview,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
@@ -1832,6 +1925,31 @@ def _cmd_planner(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
     print(_format_planner_report(report))
+    return 0
+
+
+def _cmd_planner_preview(args: argparse.Namespace) -> int:
+    board = kb.get_current_board()
+    meta = kb.read_board_metadata(board)
+    workdir = meta.get("default_workdir") or os.getcwd()
+    gate_open = getattr(args, "gate_assumption", "closed") == "open"
+    limit = max(0, int(getattr(args, "limit", 3) or 0))
+
+    with kb.connect_closing() as conn:
+        tasks = kb.list_tasks(conn, include_archived=False, limit=1000)
+
+    report = _planner_report(
+        tasks,
+        board=board,
+        gate_open=gate_open,
+        git_summary=_planner_git_summary(workdir=workdir),
+        candidate_limit=limit,
+    )
+    preview = _planner_consumer_preview(report)
+    if getattr(args, "json", False):
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return 0
+    print(_format_planner_consumer_preview(preview))
     return 0
 
 

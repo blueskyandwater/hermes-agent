@@ -855,3 +855,113 @@ def test_planner_git_summary_uses_read_only_git_commands_only(monkeypatch, tmp_p
     assert summary["ahead_count"] == 0
     assert summary["dirty_worktree"] is False
     assert len(seen) == 3
+
+
+def _planner_git_summary_stub(*, ahead_count=0, dirty_worktree=False):
+    return {
+        "workdir": "/repo",
+        "branch": "main",
+        "ahead_count": ahead_count,
+        "dirty_worktree": dirty_worktree,
+        "status_summary": "dirty" if dirty_worktree else "clean",
+        "git_available": True,
+        "errors": [],
+    }
+
+
+def test_planner_consumer_preview_reads_planner_v1_first_candidate():
+    report = kc._planner_report(
+        [_planner_task("[Planning] draft", status="ready", task_id="t_preview")],
+        board="hermes-product",
+        gate_open=True,
+        git_summary=_planner_git_summary_stub(),
+    )
+    preview = kc._planner_consumer_preview(report)
+
+    assert preview["source_schema_version"] == "planner.v1"
+    assert preview["mode"] == "planner-consumer-preview-read-only"
+    assert preview["dispatch_allowed"] is False
+    assert preview["selected_candidate"] == {
+        "task_id": "t_preview",
+        "title": "[Planning] draft",
+        "classification": "ready-for-design",
+        "required_mode": "N/A",
+        "risk_level": "low",
+        "blocked_reason": "N/A",
+        "next_human_approval": "Approve the exact design/doc scope before mutation",
+    }
+    assert "Planner is read-only: no Kanban mutation, no Git mutation, no file edits" in preview["must_not_run"]
+
+
+@pytest.mark.parametrize("report", [{}, {"schema_version": "planner.v0"}, {"schema_version": "unexpected"}])
+def test_planner_consumer_preview_rejects_unknown_schema(report):
+    with pytest.raises(ValueError, match="planner report schema mismatch"):
+        kc._planner_consumer_preview(report)
+
+
+def test_planner_consumer_preview_empty_candidates_is_safe_noop():
+    report = kc._planner_report(
+        [],
+        board="hermes-product",
+        gate_open=True,
+        git_summary=_planner_git_summary_stub(),
+    )
+    preview = kc._planner_consumer_preview(report)
+
+    assert preview["safe_noop"] is True
+    assert preview["selected_candidate"] is None
+    assert preview["dispatch_allowed"] is False
+    assert preview["dispatch_blocked_reason"] == "no candidates; safe no-op preview"
+
+
+def test_planner_consumer_preview_gate_closed_blocks_dispatch():
+    report = kc._planner_report(
+        [_planner_task("[Planning] draft", status="ready")],
+        board="hermes-product",
+        gate_open=False,
+        git_summary=_planner_git_summary_stub(),
+    )
+    preview = kc._planner_consumer_preview(report)
+    text = kc._format_planner_consumer_preview(preview)
+
+    assert preview["gate_assumption"] == "closed"
+    assert preview["dispatch_allowed"] is False
+    assert preview["dispatch_blocked_reason"] == "gate_assumption is closed; read-only preview cannot dispatch"
+    assert "dispatch allowed: no" in text
+    assert "gate_assumption is closed" in text
+
+
+def test_run_slash_planner_preview_does_not_call_kanban_mutation_functions(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub())
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("mutation function should not be called")
+
+    monkeypatch.setattr(kb, "create_task", _boom)
+    monkeypatch.setattr(kb, "assign_task", _boom)
+    monkeypatch.setattr(kb, "complete_task", _boom)
+    monkeypatch.setattr(kb, "block_task", _boom)
+    monkeypatch.setattr(kb, "unblock_task", _boom)
+
+    out = kc.run_slash("planner-preview")
+    assert "mode: planner-consumer-preview-read-only" in out
+    assert "dispatch allowed: no" in out
+
+
+def test_run_slash_planner_preview_json_shape(kanban_home, monkeypatch):
+    monkeypatch.setattr(kc, "_planner_git_summary", lambda **kwargs: _planner_git_summary_stub(dirty_worktree=True))
+    raw = kc.run_slash("planner-preview --json")
+    data = json.loads(raw)
+
+    assert data["schema_version"] == "planner-consumer-preview.v1"
+    assert data["source_schema_version"] == "planner.v1"
+    assert data["selected_candidate"]["task_id"] == "git:dirty"
+    assert set(data["selected_candidate"].keys()) == {
+        "task_id",
+        "title",
+        "classification",
+        "required_mode",
+        "risk_level",
+        "blocked_reason",
+        "next_human_approval",
+    }
