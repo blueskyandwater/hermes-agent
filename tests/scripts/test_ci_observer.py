@@ -54,11 +54,13 @@ def test_classify_nix_diagnose_crash_takes_precedence():
 
 def test_overall_classification_green_running_and_mixed():
     green = ci_observer.WorkflowObservation("Tests", 1, "completed", "success", None, "green")
+    skipped = ci_observer.WorkflowObservation("Docker Build and Publish", 2, "completed", "skipped", None, "not_applicable")
     running = ci_observer.WorkflowObservation("Nix", 2, "in_progress", None, None, "still_running")
     failed_nix = ci_observer.WorkflowObservation("Nix", 3, "completed", "failure", None, "failed_nix")
     failed_lint = ci_observer.WorkflowObservation("Lint", 4, "completed", "failure", None, "failed_lint")
 
     assert ci_observer.overall_classification([green]) == "all_green"
+    assert ci_observer.overall_classification([green, skipped]) == "all_green"
     assert ci_observer.overall_classification([green, running]) == "still_running"
     assert ci_observer.overall_classification([failed_nix]) == "failed_nix"
     assert ci_observer.overall_classification([failed_nix, failed_lint]) == "mixed"
@@ -189,3 +191,43 @@ def test_observe_uses_failed_logs_only_for_failed_runs_and_includes_git_status(m
     assert not any(call[:2] == ("git", "add") for call in calls)
     assert not any(call[:2] == ("git", "commit") for call in calls)
     assert not any(call[:2] == ("git", "push") for call in calls)
+
+
+def test_skipped_workflow_is_not_applicable_and_does_not_fetch_failed_log(monkeypatch):
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv, *, timeout=120):
+        calls.append(tuple(argv))
+        if argv == ["git", "config", "--get", "remote.origin.url"]:
+            return "https://github.com/blueskyandwater/hermes-agent.git\n"
+        if argv[:2] == ["gh", "api"] and "/commits/" in argv[2]:
+            return '{"sha": "abc123full"}'
+        if argv[:2] == ["gh", "api"] and "/actions/runs?" in argv[2]:
+            return """
+            {
+              "workflow_runs": [
+                {"id": 10, "name": "Lint (ruff + ty)", "head_sha": "abc123full", "status": "completed", "conclusion": "success", "html_url": "https://example.test/10"},
+                {"id": 11, "name": "Tests", "head_sha": "abc123full", "status": "completed", "conclusion": "success", "html_url": "https://example.test/11"},
+                {"id": 12, "name": "Nix", "head_sha": "abc123full", "status": "completed", "conclusion": "success", "html_url": "https://example.test/12"},
+                {"id": 13, "name": "Docker Build and Publish", "head_sha": "abc123full", "status": "completed", "conclusion": "skipped", "html_url": "https://example.test/13"}
+              ]
+            }
+            """
+        if argv[:3] == ["gh", "run", "view"] and "--log-failed" in argv:
+            raise AssertionError("skipped workflows must not fetch failed logs")
+        if argv[:2] == ["git", "status"]:
+            return "## main...origin/main\n"
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(ci_observer, "run_read_only", fake_run)
+    result = ci_observer.observe(Namespace(branch="main", commit="abc123", workflow=None, run_id=None, format="text"))
+
+    docker = next(workflow for workflow in result.workflows if workflow.workflow_name == "Docker Build and Publish")
+    assert docker.classification == "not_applicable"
+    assert docker.root_cause_category == "workflow_not_triggered"
+    assert docker.next_minimal_action == "none"
+    assert docker.decisive_lines == []
+    assert result.summary["not_applicable"] == 1
+    assert result.summary["completed_failed"] == 0
+    assert result.overall_classification == "all_green"
+    assert not any(call[:3] == ("gh", "run", "view") and "--log-failed" in call for call in calls)

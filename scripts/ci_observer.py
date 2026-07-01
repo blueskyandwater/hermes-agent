@@ -24,6 +24,7 @@ MAX_DECISIVE_LINES = 8
 CLASSIFICATIONS = {
     "all_green",
     "still_running",
+    "not_applicable",
     "failed_lint",
     "failed_tests",
     "failed_nix",
@@ -314,6 +315,8 @@ def next_action(root_cause: str, classification: str) -> str:
     }
     if classification == "still_running":
         return "wait_for_running_jobs"
+    if classification == "not_applicable":
+        return "none"
     return actions.get(root_cause, "inspect_failed_log")
 
 
@@ -328,6 +331,10 @@ def classify_workflow(run: dict[str, Any], log_text: str | None = None) -> Workf
     elif status == "completed" and conclusion == "success":
         classification = "green"
         root_cause = "none"
+        decisive_lines = []
+    elif status == "completed" and conclusion == "skipped":
+        classification = "not_applicable"
+        root_cause = "workflow_not_triggered"
         decisive_lines = []
     elif status == "completed" and conclusion in {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}:
         kind = workflow_kind(workflow_name)
@@ -374,7 +381,7 @@ def overall_classification(workflows: Sequence[WorkflowObservation]) -> str:
     if any(item == "still_running" for item in classes):
         return "still_running"
     failures = [item for item in classes if item.startswith("failed_")]
-    if not failures and all(item == "green" for item in classes):
+    if not failures and all(item in {"green", "not_applicable"} for item in classes):
         return "all_green"
     unique_failures = sorted(set(failures))
     if len(unique_failures) == 1:
@@ -391,7 +398,7 @@ def summarize(workflows: Sequence[WorkflowObservation], missing_expected: Sequen
         "completed_failed": sum(1 for wf in workflows if wf.status == "completed" and wf.conclusion not in {"success", "skipped", None}),
         "running": sum(1 for wf in workflows if wf.status in {"queued", "in_progress", "waiting", "requested", "pending"}),
         "queued": sum(1 for wf in workflows if wf.status == "queued"),
-        "not_applicable": len(missing_expected),
+        "not_applicable": len(missing_expected) + sum(1 for wf in workflows if wf.classification == "not_applicable"),
     }
 
 
