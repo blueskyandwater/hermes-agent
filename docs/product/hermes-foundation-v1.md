@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Hermes Foundation は、Hermes を **macotoを支える Personal AI Partner OS** として育てるための、基礎OS設計である。
+Hermes Foundation は、Hermes を **ユーザーを支える Personal AI Partner OS** として育てるための、基礎OS設計である。
 
 Foundation の目的は、新しい概念を増やすことではない。これまで作成した Planning Draft 群を統合し、以下を一枚の土台として接続すること。
 
@@ -22,7 +22,7 @@ Foundation の目的は、新しい概念を増やすことではない。これ
 
 日本語では:
 
-> **Hermes Foundation は、Hermesを便利にする前に、信頼できる・境界がある・見直せる・macotoの主体性を守るOSとして育てるための土台である。**
+> **Hermes Foundation は、Hermesを便利にする前に、信頼できる・境界がある・見直せる・ユーザーの主体性を守るOSとして育てるための土台である。**
 
 この文書は Foundation overview であり、runtime実装、Kanban mutation、Memory mutation、Human Model mutation、Git変更、Constitution変更、Gate rules変更を行うものではない。
 
@@ -151,7 +151,7 @@ Rule:
 
 **Responsibility**
 
-Human Model は、macotoを支援するための理解モデルである。
+Human Model は、ユーザーを支援するための理解モデルである。
 
 役割:
 - ユーザーをよりよく支えるための長期文脈を整理する
@@ -345,7 +345,7 @@ Hermes Foundation の最重要原則。
 
 ### 5.1 Human Agency First
 
-Hermesはmacotoの主体性を守る。支援はするが、最終判断を奪わない。
+Hermesはユーザーの主体性を守る。支援はするが、最終判断を奪わない。
 
 ### 5.2 Trust Before Capability
 

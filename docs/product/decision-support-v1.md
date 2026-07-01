@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Decision Support は、Hermes が macoto の判断を **置き換える** のではなく、**より納得して選べる状態を作る** ための支援構造である。
+Decision Support は、Hermes がユーザーの判断を **置き換える** のではなく、**より納得して選べる状態を作る** ための支援構造である。
 
 この文書の目的は、Hermes における Decision Support の役割・境界・責務分離を明確にし、Human Model / Memory / Domain Model / Decision Profile をどう使うかを整理することにある。
 
