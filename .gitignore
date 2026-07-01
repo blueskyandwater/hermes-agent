@@ -29,6 +29,21 @@ __pycache__/model_tools.cpython-310.pyc
 __pycache__/web_tools.cpython-310.pyc
 logs/
 data/
+
+# Local runtime state / logs / stores
+*.db
+*.sqlite
+*.sqlite3
+*.log
+state.db
+state.db-*
+usage.log
+gateway.log
+response_store
+response_store.*
+memory_store
+memory_store.*
+
 .pytest_cache/
 test_durations.json
 .pytest-cache/
@@ -50,6 +65,10 @@ agent-browser/
 # Private keys
 *.ppk
 *.pem
+*.key
+*.crt
+*.p12
+*.pfx
 privvy*
 images/
 __pycache__/
