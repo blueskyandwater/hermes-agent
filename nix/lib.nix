@@ -16,15 +16,54 @@
   nodejs,
 }:
 let
-  # The workspace root — where the single package-lock.json lives.
-  src = ../.;
+  # The workspace root — where the single package-lock.json lives and where
+  # npm workspace packages are built from.
+  packageSrc = ../.;
 
-  # Single npm deps fetch from the workspace root lockfile.
+  # fetchNpmDeps must not hash the whole repository. If its src includes
+  # nix/lib.nix, then changing npmDepsHash changes the src and the expected
+  # fixed-output hash can ping-pong between two values. Keep the npm deps
+  # source to the lockfile plus the package manifests that can affect npm's
+  # dependency graph.
+  npmDepsFiles = [
+    "package-lock.json"
+    "package.json"
+    "apps/bootstrap-installer/package.json"
+    "apps/desktop/package.json"
+    "apps/shared/package.json"
+    "ui-tui/package.json"
+    "ui-tui/packages/hermes-ink/package.json"
+    "web/package.json"
+  ];
+
+  rootString = toString packageSrc;
+  relPath =
+    path:
+    let
+      pathString = toString path;
+    in
+    if pathString == rootString then "" else pkgs.lib.removePrefix "${rootString}/" pathString;
+
+  npmDepsSrc = pkgs.lib.cleanSourceWith {
+    name = "hermes-agent-npm-deps-src";
+    src = packageSrc;
+    filter =
+      path: type:
+      let
+        rel = relPath path;
+      in
+      if type == "directory" then
+        rel == "" || pkgs.lib.any (file: pkgs.lib.hasPrefix "${rel}/" file) npmDepsFiles
+      else
+        builtins.elem rel npmDepsFiles;
+  };
+
+  # Single npm deps fetch from the workspace root lockfile/manifests.
   # All workspace packages share this derivation.
-  npmDepsHash = "sha256-TDniZxNeVjtszsPDV+Bg0blNUHrFCIEcTa/RLnO5o+k=";
+  npmDepsHash = "sha256-6box8XWBYxR0yXYTR7KpZp7rlo8pAQvp1tVxmvx9B9U=";
 
   npmDeps = pkgs.fetchNpmDeps {
-    inherit src;
+    src = npmDepsSrc;
     fetcherVersion = 2;
     hash = npmDepsHash;
   };
@@ -61,7 +100,8 @@ in
       # so npmConfigHook finds the lockfile there.
     in
     {
-      inherit src npmDeps nodejs;
+      src = packageSrc;
+      inherit npmDeps nodejs;
       npmRoot = ".";
       npmDepsFetcherVersion = 2;
 
@@ -245,17 +285,17 @@ in
       if [ -n "$LINK_REPO" ] && [ -n "$LINK_SHA" ]; then
         LIB_URL="$LINK_SERVER/$LINK_REPO/blob/$LINK_SHA/$LIB_FILE#L$HASH_LINE"
         LOCK_URL="$LINK_SERVER/$LINK_REPO/blob/$LINK_SHA/$LOCK_FILE"
-        REPORT="- [\`$LIB_FILE:$HASH_LINE\`]($LIB_URL): \`$OLD_HASH\` → \`$NEW_HASH\` — lockfile: [\`$LOCK_FILE\`]($LOCK_URL)"$'\\n'
+        REPORT="- [\`$LIB_FILE:$HASH_LINE\`]($LIB_URL): \`$OLD_HASH\` → \`$NEW_HASH\` — lockfile: [\`$LOCK_FILE\`]($LOCK_URL)"
       else
-        REPORT="- \`$LIB_FILE:$HASH_LINE\`: \`$OLD_HASH\` → \`$NEW_HASH\`"$'\\n'
+        REPORT="- \`$LIB_FILE:$HASH_LINE\`: \`$OLD_HASH\` → \`$NEW_HASH\`"
       fi
 
       if [ "$MODE" = "--apply" ]; then
         sed -i -E "s|npmDepsHash = \"sha256-[^\"]+\";|npmDepsHash = \"$NEW_HASH\";|" "$LIB_FILE"
         if ! nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>/dev/null; then
-          # prefetch-npm-deps may disagree with fetchNpmDeps (it hashes
-          # the lockfile contents, not the full source tree).  Extract the
-          # correct hash from the nix build error and retry.
+          # If prefetch-npm-deps ever disagrees with fetchNpmDeps, extract
+          # the hash from the nix build error and retry. fetchNpmDeps uses
+          # npmDepsSrc above, so this retry no longer changes its own input.
           RETRY_OUTPUT=$(nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>&1)
           CORRECT_HASH=$(echo "$RETRY_OUTPUT" | awk '/got:/ {print $2; exit}')
           if [ -n "$CORRECT_HASH" ]; then
@@ -281,7 +321,7 @@ in
           [ "$FIXED" -eq 1 ] && echo "changed=true" || echo "changed=false"
           if [ -n "$REPORT" ]; then
             echo "report<<REPORT_EOF"
-            printf "%s" "$REPORT"
+            printf "%s\n" "$REPORT"
             echo "REPORT_EOF"
           fi
         } >> "$GITHUB_OUTPUT"

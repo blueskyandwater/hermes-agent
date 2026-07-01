@@ -6,8 +6,12 @@ on:
     paths:
       - 'package-lock.json'
       - 'package.json'
-      - 'ui-tui/package.json'
+      - 'apps/bootstrap-installer/package.json'
       - 'apps/desktop/package.json'
+      - 'apps/shared/package.json'
+      - 'ui-tui/package.json'
+      - 'ui-tui/packages/hermes-ink/package.json'
+      - 'web/package.json'
   workflow_dispatch:
     inputs:
       pr_number:
@@ -77,7 +81,7 @@ jobs:
 
           # Ensure only nix files were modified — prevents accidental
           # self-triggering if fix-lockfiles ever touches package files.
-          unexpected="$(git diff --name-only | grep -Ev '^nix/(tui|web)\.nix$' || true)"
+          unexpected="$(git diff --name-only | grep -Ev '^nix/lib\.nix$' || true)"
           if [ -n "$unexpected" ]; then
             echo "::error::Unexpected modified files: $unexpected"
             exit 1
@@ -89,7 +93,7 @@ jobs:
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add nix/tui.nix nix/web.nix
+          git add nix/lib.nix
           git commit -m "fix(nix): auto-refresh npm lockfile hashes" \
             -m "Source: $GITHUB_SHA" \
             -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -110,7 +114,12 @@ jobs:
             # run recompute from the correct package-lock state.
             pkg_changed="$(git diff --name-only "$BASE_SHA"..origin/main -- \
               'package-lock.json' 'package.json' \
-              'ui-tui/package.json' 'apps/desktop/package.json' || true)"
+              'apps/bootstrap-installer/package.json' \
+              'apps/desktop/package.json' \
+              'apps/shared/package.json' \
+              'ui-tui/package.json' \
+              'ui-tui/packages/hermes-ink/package.json' \
+              'web/package.json' || true)"
             if [ -n "$pkg_changed" ]; then
               echo "::warning::Package files changed since hash computation — aborting; a fresh run will recompute"
               exit 0
@@ -216,7 +225,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add nix/tui.nix nix/web.nix
+          git add nix/lib.nix
           git commit -m "fix(nix): refresh npm lockfile hashes"
           git push
 
