@@ -60,7 +60,7 @@ let
 
   # Single npm deps fetch from the workspace root lockfile/manifests.
   # All workspace packages share this derivation.
-  npmDepsHash = "sha256-6box8XWBYxR0yXYTR7KpZp7rlo8pAQvp1tVxmvx9B9U=";
+  npmDepsHash = "sha256-vyfBuDkZrvPd8FVD0BSEbLa1rCJ3hD7B1CO7yu5EPgY=";
 
   npmDeps = pkgs.fetchNpmDeps {
     src = npmDepsSrc;
@@ -245,33 +245,41 @@ in
       REPORT=""
 
       # All workspace packages share the root package-lock.json, so
-      # we only need to check the hash once.
+      # we only need to check the hash once. Treat fetchNpmDeps itself as
+      # the source of truth: it hashes npmDepsSrc, not just package-lock.json.
       LOCK_FILE="package-lock.json"
       LIB_FILE="nix/lib.nix"
-      NEW_HASH=$(${pkgs.lib.getExe pkgs.prefetch-npm-deps} "$LOCK_FILE" 2>/dev/null)
-      if [ -z "$NEW_HASH" ]; then
-        echo "prefetch-npm-deps failed, falling back to nix build" >&2
-        OUTPUT=$(nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>&1)
-        STATUS=$?
-        if [ "$STATUS" -eq 0 ]; then
-          echo "ok (via nix build)"
-          exit 0
-        fi
-        NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
-        if [ -z "$NEW_HASH" ]; then
-          if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
-            echo "skipped (transient cache failure — see primary nix build for real status)" >&2
-            echo "$OUTPUT" | tail -8 >&2
-            exit 0
-          fi
-          echo "build failed with no hash mismatch:" >&2
-          echo "$OUTPUT" | tail -40 >&2
-          exit 1
-        fi
-      fi
 
       OLD_HASH=$(grep -oE 'npmDepsHash = "sha256-[^"]+"' "$LIB_FILE" | head -1 \
         | sed -E 's/npmDepsHash = "(.*)"/\1/')
+
+      OUTPUT=$(nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>&1)
+      STATUS=$?
+      PREFETCH_HASH=$(${pkgs.lib.getExe pkgs.prefetch-npm-deps} "$LOCK_FILE" 2>/dev/null || true)
+
+      if [ "$STATUS" -eq 0 ]; then
+        if [ -n "$PREFETCH_HASH" ] && [ "$PREFETCH_HASH" != "$OLD_HASH" ]; then
+          echo "prefetch-npm-deps reports $PREFETCH_HASH, but fetchNpmDeps accepted $OLD_HASH; keeping fetchNpmDeps as source of truth" >&2
+        fi
+        echo "ok (via fetchNpmDeps)"
+        exit 0
+      fi
+
+      NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
+      if [ -z "$NEW_HASH" ]; then
+        if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
+          echo "skipped (transient cache failure — see primary nix build for real status)" >&2
+          echo "$OUTPUT" | tail -8 >&2
+          exit 0
+        fi
+        echo "build failed with no hash mismatch:" >&2
+        echo "$OUTPUT" | tail -40 >&2
+        exit 1
+      fi
+
+      if [ -n "$PREFETCH_HASH" ] && [ "$PREFETCH_HASH" != "$NEW_HASH" ]; then
+        echo "prefetch-npm-deps reports $PREFETCH_HASH, but fetchNpmDeps wants $NEW_HASH; using fetchNpmDeps" >&2
+      fi
 
       if [ "$NEW_HASH" = "$OLD_HASH" ]; then
         echo "ok"
@@ -292,24 +300,9 @@ in
 
       if [ "$MODE" = "--apply" ]; then
         sed -i -E "s|npmDepsHash = \"sha256-[^\"]+\";|npmDepsHash = \"$NEW_HASH\";|" "$LIB_FILE"
-        if ! nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>/dev/null; then
-          # If prefetch-npm-deps ever disagrees with fetchNpmDeps, extract
-          # the hash from the nix build error and retry. fetchNpmDeps uses
-          # npmDepsSrc above, so this retry no longer changes its own input.
-          RETRY_OUTPUT=$(nix build ".#${attr}.npmDeps" --no-link --print-build-logs 2>&1)
-          CORRECT_HASH=$(echo "$RETRY_OUTPUT" | awk '/got:/ {print $2; exit}')
-          if [ -n "$CORRECT_HASH" ]; then
-            echo "prefetch-npm-deps gave $NEW_HASH but nix wants $CORRECT_HASH — retrying" >&2
-            sed -i -E "s|npmDepsHash = \"sha256-[^\"]+\";|npmDepsHash = \"$CORRECT_HASH\";|" "$LIB_FILE"
-            if ! nix build ".#${attr}.npmDeps" --no-link --print-build-logs; then
-              echo "verification build failed after hash retry" >&2
-              exit 1
-            fi
-            NEW_HASH="$CORRECT_HASH"
-          else
-            echo "verification build failed after hash update" >&2
-            exit 1
-          fi
+        if ! nix build ".#${attr}.npmDeps" --no-link --print-build-logs; then
+          echo "verification build failed after fetchNpmDeps hash update" >&2
+          exit 1
         fi
         FIXED=1
         echo "fixed"
