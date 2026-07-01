@@ -42,14 +42,11 @@ import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import Any, Optional, cast
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-
-if TYPE_CHECKING:
-    from fastapi import UploadFile
 
 try:  # Optional at runtime; FastAPI's File/Form endpoints require python-multipart.
     try:
@@ -706,7 +703,7 @@ if _MULTIPART_AVAILABLE:
     @router.post("/tasks/{task_id}/attachments")
     async def upload_task_attachment(
         task_id: str,
-        file: "UploadFile" = _required_upload_file,
+        file: UploadFile = _required_upload_file,
         board: Optional[str] = Query(None),
         uploaded_by: Optional[str] = _optional_uploaded_by,
     ):

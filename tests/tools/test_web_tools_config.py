@@ -601,9 +601,9 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_no_keys_returns_false(self):
+    def test_no_keys_still_returns_true_via_free_local_backend(self):
         from tools.web_tools import check_web_api_key
-        assert check_web_api_key() is False
+        assert check_web_api_key() is True
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {

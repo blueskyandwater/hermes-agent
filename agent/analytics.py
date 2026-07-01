@@ -47,7 +47,7 @@ def _resolve_log_path(path: str | None = None) -> str:
     if os.path.isfile(cfg_path):
         try:
             import yaml  # optional dep
-            with open(cfg_path) as f:
+            with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             p = cfg.get("usage_log_path", "")
             if p:
@@ -156,7 +156,7 @@ class UsageLogAnalytics:
 
         records: List[dict] = []
         malformed = 0
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:

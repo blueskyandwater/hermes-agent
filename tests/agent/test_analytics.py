@@ -18,9 +18,13 @@ from agent.analytics import UsageLogAnalytics
 # Fixtures
 # ---------------------------------------------------------------------------
 
+_NOW = datetime.now(timezone.utc)
+_DAY_1 = (_NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+_DAY_2 = (_NOW - timedelta(days=1)).strftime("%Y-%m-%d")
+
 SAMPLE_RECORDS = [
     {
-        "ts": "2026-06-01T10:00:00",
+        "ts": f"{_DAY_1}T10:00:00",
         "request_id": "a1",
         "model": "deepseek/deepseek-v4-flash",
         "provider": "openrouter",
@@ -36,7 +40,7 @@ SAMPLE_RECORDS = [
         "status": "success",
     },
     {
-        "ts": "2026-06-01T11:00:00",
+        "ts": f"{_DAY_1}T11:00:00",
         "request_id": "a2",
         "model": "perplexity/sonar",
         "provider": "openrouter",
@@ -52,7 +56,7 @@ SAMPLE_RECORDS = [
         "status": "success",
     },
     {
-        "ts": "2026-06-02T10:00:00",
+        "ts": f"{_DAY_2}T10:00:00",
         "request_id": "a3",
         "model": "deepseek/deepseek-v4-flash",
         "provider": "openrouter",
@@ -69,7 +73,7 @@ SAMPLE_RECORDS = [
     },
     # Bypass record
     {
-        "ts": "2026-06-02T11:00:00",
+        "ts": f"{_DAY_2}T11:00:00",
         "request_id": "a4",
         "model": "",
         "provider": "",
@@ -85,7 +89,7 @@ SAMPLE_RECORDS = [
     },
     # Fallback record
     {
-        "ts": "2026-06-02T12:00:00",
+        "ts": f"{_DAY_2}T12:00:00",
         "request_id": "a5",
         "model": "deepseek/deepseek-v4-flash",
         "provider": "openrouter",
@@ -103,7 +107,7 @@ SAMPLE_RECORDS = [
     },
     # Error record
     {
-        "ts": "2026-06-02T13:00:00",
+        "ts": f"{_DAY_2}T13:00:00",
         "request_id": "a6",
         "model": "deepseek/deepseek-v4-flash",
         "provider": "openrouter",
@@ -118,7 +122,7 @@ SAMPLE_RECORDS = [
     },
 ]
 
-MALFORMED_LINE = b'{"ts": "2026-06-01", "model": "truncated...\n'
+MALFORMED_LINE = b'{"ts": "malformed", "model": "truncated...\n'
 
 
 @pytest.fixture
@@ -277,8 +281,8 @@ class TestAggregateDaily:
         report = analytics.aggregate_daily(days=7)
         breakdown = report["daily_breakdown"]
         assert len(breakdown) == 2
-        assert breakdown[0]["date"] == "2026-06-01"
-        assert breakdown[1]["date"] == "2026-06-02"
+        assert breakdown[0]["date"] == _DAY_1
+        assert breakdown[1]["date"] == _DAY_2
 
 
 class TestAggregateWeekly:
