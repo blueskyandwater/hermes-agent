@@ -168,6 +168,7 @@ def test_get_version_info_derives_identity_from_reachable_release_tag(tmp_path, 
     git("commit", "-qm", "release")
     git("tag", "v0.21.4")
     git("tag", "v2026.9.21")
+    git("tag", "v0.21.5+canary.20260929T070217Z")
     (repo / "tracked").write_text("next\n", encoding="utf-8")
     git("commit", "-qam", "next")
 
@@ -179,6 +180,41 @@ def test_get_version_info_derives_identity_from_reachable_release_tag(tmp_path, 
     assert info.base_version == "0.21.4"
     assert info.derived_version == f"0.21.4+1.g{git('rev-parse', '--short=7', 'HEAD')}"
     assert info.distance == 1
+    assert info.commit == git("rev-parse", "HEAD")
+    assert info.source == "git"
+
+
+def test_get_version_info_uses_reachable_canary_core_before_older_calver(tmp_path, monkeypatch):
+    """An unstamped source install derives the canary's stable core from its tag."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=repo, text=True, capture_output=True, check=True,
+            env={"HOME": str(tmp_path), "PATH": __import__("os").environ["PATH"]},
+        )
+        return result.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes@example.invalid")
+    (repo / "pyproject.toml").write_text('[project]\nversion = "0.15.1"\n', encoding="utf-8")
+    git("add", "pyproject.toml")
+    git("commit", "-qm", "older release")
+    git("tag", "v2026.5.29")
+    (repo / "pyproject.toml").write_text('[project]\nversion = "0.0.0"\n', encoding="utf-8")
+    git("commit", "-qam", "canary")
+    git("tag", "-a", "v0.21.4+canary.20260929T070217Z", "-m", "canary")
+    git("commit", "--allow-empty", "-qm", "integration")
+
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+
+    info = get_version_info()
+    assert info.base_version == "0.21.4"
+    assert info.distance == 1
+    assert info.derived_version == f"0.21.4+1.g{git('rev-parse', '--short=7', 'HEAD')}"
     assert info.commit == git("rev-parse", "HEAD")
     assert info.source == "git"
 

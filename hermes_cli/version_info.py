@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from hermes_cli.steward import UPDATE_MECHANISMS
-from hermes_cli.update_channel import STABLE_TAG_RE
+from hermes_cli.update_channel import STABLE_TAG_RE, is_canary_tag
 
 
 @dataclass(frozen=True)
@@ -237,14 +237,23 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
         for tag in (tags or "").splitlines()
         if STABLE_TAG_RE.fullmatch(tag)
     ]
-    base_version = (
-        max(releases, key=lambda value: tuple(int(part) for part in value.split(".")))
-        if releases else "unknown"
-    )
+    if releases:
+        base_version = max(releases, key=lambda value: tuple(int(part) for part in value.split(".")))
+        release_tag = f"v{base_version}"
+    else:
+        # A canary tag carries the stable core in SemVer build metadata; the
+        # checkout's pyproject version (0.0.0 in source builds) is not a release.
+        # Stable tags still take precedence when one is reachable.
+        canaries = [tag for tag in (tags or "").splitlines() if is_canary_tag(tag)]
+        release_tag = max(
+            canaries,
+            key=lambda tag: (tuple(int(part) for part in tag[1:].split("+", 1)[0].split(".")), tag.split("+canary.", 1)[1]),
+        ) if canaries else None
+        base_version = release_tag[1:].split("+", 1)[0] if release_tag else "unknown"
     distance = _parse_nonnegative(
-        _run_git(repo_dir, "rev-list", "--count", f"v{base_version}..HEAD")
-    ) if releases else None
-    if not releases:
+        _run_git(repo_dir, "rev-list", "--count", f"{release_tag}..HEAD")
+    ) if release_tag else None
+    if not release_tag:
         base_version, distance = _calver_release_version(repo_dir) or ("unknown", None)
     short_commit = _run_git(repo_dir, "rev-parse", "--short=7", "HEAD")
     if base_version == "unknown" and short_commit:
