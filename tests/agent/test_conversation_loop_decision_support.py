@@ -164,6 +164,21 @@ class _Agent:
         raise _CaptureApiMessages()
 
 
+
+def _capture_extracted_assembly(agent, user_message, *, conversation_history=None, **kwargs):
+    """Exercise the new request-copy phase, not the obsolete monolithic-loop fixture."""
+    from agent.turn_context import build_api_messages
+    messages = list(conversation_history or []) + [{"role": "user", "content": user_message}]
+    agent._current_turn_timestamp = 0
+    agent.captured_messages_before_api = copy.deepcopy(messages)
+    agent.captured_api_messages, _ = build_api_messages(
+        agent, messages, current_turn_user_idx=len(messages) - 1,
+        ext_prefetch_cache=agent._memory_manager.prefetch_text,
+        plugin_user_context=agent.plugin_context, moa_config=None,
+        active_system_prompt=agent._cached_system_prompt,
+    )
+    raise _CaptureApiMessages()
+
 def _stub_run_agent_module():
     return SimpleNamespace(_set_interrupt=lambda *_args, **_kwargs: None)
 
@@ -180,8 +195,7 @@ def test_run_conversation_injects_decision_support_only_into_current_user_api_co
     original_history = copy.deepcopy(history)
     agent = _Agent(plugin_context=plugin_context, memory_prefetch=memory_prefetch)
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: [{"context": plugin_context}])
-    monkeypatch.setattr("agent.conversation_loop._ra", _stub_run_agent_module)
+    monkeypatch.setattr("agent.conversation_loop._run_conversation_turn", _capture_extracted_assembly)
 
     with pytest.raises(_CaptureApiMessages):
         run_conversation(
@@ -221,8 +235,7 @@ def test_run_conversation_does_not_inject_decision_support_without_opt_in(monkey
     memory_prefetch = "remembered fact"
     agent = _Agent(plugin_context=plugin_context, memory_prefetch=memory_prefetch)
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: [{"context": plugin_context}])
-    monkeypatch.setattr("agent.conversation_loop._ra", _stub_run_agent_module)
+    monkeypatch.setattr("agent.conversation_loop._run_conversation_turn", _capture_extracted_assembly)
 
     with pytest.raises(_CaptureApiMessages):
         run_conversation(

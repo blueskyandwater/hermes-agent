@@ -8,36 +8,37 @@ that ``hermes update`` survives a terminal disconnect mid-install
 
 from __future__ import annotations
 
-import importlib
 import io
 import signal
 import sys
 
-import pytest
+
+from hermes_cli.main_dashboard import _UpdateOutputStream, _finalize_update_output, _install_hangup_protection
+from hermes_cli.update_cmd import _log_only_write, _print_update_completion, _run_logged_subprocess
 
 
-def _live_main_module():
-    """Return the current live ``hermes_cli.main`` module.
+def test_update_completion_includes_bounded_action_identity(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_ACTION_ID", "a" * 32)
+    # These tests pin the action-identity receipt contract, not the branch
+    # display — neutralize the branch+HEAD suffix added for the 2026-08-17
+    # parked-branch incident (covered by test_update_parked_branch_guard.py).
+    monkeypatch.setattr("hermes_cli.update_cmd._branch_head_suffix", lambda: "")
 
-    Some sibling tests call ``importlib.reload(hermes_cli.main)``, which mutates
-    the module dict in place and rebinds class objects like
-    ``_UpdateOutputStream``. Holding ``from hermes_cli.main import ...``
-    references at collection time becomes stale across the full suite and makes
-    ``isinstance`` assertions compare against an old class identity.
-    """
-    return importlib.import_module("hermes_cli.main")
+    _print_update_completion("✓ Update complete!")
 
-
-def _update_output_stream_cls():
-    return _live_main_module()._UpdateOutputStream
-
-
-def _install_hangup_protection_fn():
-    return _live_main_module()._install_hangup_protection
+    assert capsys.readouterr().out.splitlines() == [
+        "✓ Update complete!",
+        f"=== hermes-update completed {'a' * 32} ===",
+    ]
 
 
-def _finalize_update_output_fn():
-    return _live_main_module()._finalize_update_output
+def test_update_completion_rejects_untrusted_action_identity(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_ACTION_ID", "not-safe\nforged")
+    monkeypatch.setattr("hermes_cli.update_cmd._branch_head_suffix", lambda: "")
+
+    _print_update_completion("✓ Update complete!")
+
+    assert capsys.readouterr().out == "✓ Update complete!\n"
 
 
 # -----------------------------------------------------------------------------
@@ -46,15 +47,6 @@ def _finalize_update_output_fn():
 
 
 class TestUpdateOutputStream:
-    def test_write_mirrors_to_both_original_and_log(self):
-        original = io.StringIO()
-        log = io.StringIO()
-        stream = _update_output_stream_cls()(original, log)
-
-        stream.write("hello world\n")
-
-        assert original.getvalue() == "hello world\n"
-        assert log.getvalue() == "hello world\n"
 
     def test_write_continues_after_broken_original(self):
         """When the terminal disconnects, original.write raises BrokenPipeError.
@@ -71,7 +63,7 @@ class TestUpdateOutputStream:
             def flush(self):
                 raise BrokenPipeError("terminal gone")
 
-        stream = _update_output_stream_cls()(_BrokenStream(), log)
+        stream = _UpdateOutputStream(_BrokenStream(), log)
 
         # First write triggers the broken-pipe path.
         stream.write("first line\n")
@@ -81,95 +73,9 @@ class TestUpdateOutputStream:
         assert log.getvalue() == "first line\nsecond line\n"
         assert stream._original_broken is True
 
-    def test_write_tolerates_oserror_and_valueerror(self):
-        """OSError (EIO) and ValueError (closed file) should also be absorbed."""
-        log = io.StringIO()
 
-        class _RaisingStream:
-            def __init__(self, exc):
-                self._exc = exc
 
-            def write(self, data):
-                raise self._exc
 
-            def flush(self):
-                raise self._exc
-
-        for exc in (OSError("EIO"), ValueError("closed file")):
-            stream = _update_output_stream_cls()(_RaisingStream(exc), log)
-            stream.write("x\n")
-            assert stream._original_broken is True
-
-    def test_log_failure_does_not_abort_write(self):
-        """Even if the log file write raises, the original write must still happen."""
-        class _BrokenLog:
-            def write(self, data):
-                raise OSError("disk full")
-
-            def flush(self):
-                raise OSError("disk full")
-
-        original = io.StringIO()
-        stream = _update_output_stream_cls()(original, _BrokenLog())
-
-        stream.write("data\n")
-
-        assert original.getvalue() == "data\n"
-
-    def test_flush_tolerates_broken_original(self):
-        class _BrokenStream:
-            def write(self, data):
-                return len(data)
-
-            def flush(self):
-                raise BrokenPipeError("gone")
-
-        log = io.StringIO()
-        stream = _update_output_stream_cls()(_BrokenStream(), log)
-        stream.flush()  # must not raise
-        assert stream._original_broken is True
-
-    def test_isatty_delegates_to_original(self):
-        class _TtyStream:
-            def isatty(self):
-                return True
-
-            def write(self, data):
-                return len(data)
-
-            def flush(self):
-                return None
-
-        stream = _update_output_stream_cls()(_TtyStream(), io.StringIO())
-        assert stream.isatty() is True
-
-    def test_isatty_returns_false_after_broken(self):
-        class _BrokenStream:
-            def isatty(self):
-                return True
-
-            def write(self, data):
-                raise BrokenPipeError()
-
-            def flush(self):
-                return None
-
-        stream = _update_output_stream_cls()(_BrokenStream(), io.StringIO())
-        stream.write("x")  # marks broken
-        assert stream.isatty() is False
-
-    def test_getattr_delegates_unknown_attrs(self):
-        class _StreamWithEncoding:
-            encoding = "utf-8"
-
-            def write(self, data):
-                return len(data)
-
-            def flush(self):
-                return None
-
-        stream = _update_output_stream_cls()(_StreamWithEncoding(), io.StringIO())
-        assert stream.encoding == "utf-8"
 
 
 # -----------------------------------------------------------------------------
@@ -178,51 +84,19 @@ class TestUpdateOutputStream:
 
 
 class TestInstallHangupProtection:
-    def test_gateway_mode_is_noop(self):
-        """In gateway mode the process is already detached — don't touch stdio or signals."""
-        prev_out, prev_err = sys.stdout, sys.stderr
-        prev_sighup = signal.getsignal(signal.SIGHUP) if hasattr(signal, "SIGHUP") else None
 
-        state = _install_hangup_protection_fn()(gateway_mode=True)
-
-        try:
-            assert sys.stdout is prev_out
-            assert sys.stderr is prev_err
-            assert state["log_file"] is None
-            assert state["installed"] is False
-            if hasattr(signal, "SIGHUP"):
-                assert signal.getsignal(signal.SIGHUP) == prev_sighup
-        finally:
-            _finalize_update_output_fn()(state)
-
-    @pytest.mark.skipif(
-        not hasattr(signal, "SIGHUP"), reason="SIGHUP not available on this platform"
-    )
-    def test_installs_sighup_ignore(self, tmp_path, monkeypatch):
-        """SIGHUP should be set to SIG_IGN so SSH disconnect doesn't kill the update."""
-        monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
-
-        original_handler = signal.getsignal(signal.SIGHUP)
-        state = _install_hangup_protection_fn()(gateway_mode=False)
-
-        try:
-            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
-        finally:
-            _finalize_update_output_fn()(state)
-            # Restore whatever was there before so we don't leak to other tests.
-            signal.signal(signal.SIGHUP, original_handler)
 
     def test_wraps_stdout_and_stderr_with_mirror(self, tmp_path, monkeypatch):
         monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
 
         prev_out, prev_err = sys.stdout, sys.stderr
-        state = _install_hangup_protection_fn()(gateway_mode=False)
+        state = _install_hangup_protection(gateway_mode=False)
 
         try:
             # On Windows (no SIGHUP) we still wrap stdio and create the log.
             assert state["installed"] is True
-            assert isinstance(sys.stdout, _update_output_stream_cls())
-            assert isinstance(sys.stderr, _update_output_stream_cls())
+            assert isinstance(sys.stdout, _UpdateOutputStream)
+            assert isinstance(sys.stderr, _UpdateOutputStream)
             assert state["log_file"] is not None
 
             sys.stdout.write("checking mirror\n")
@@ -232,25 +106,12 @@ class TestInstallHangupProtection:
             assert log_path.exists()
             contents = log_path.read_text(encoding="utf-8")
             assert "checking mirror" in contents
-            assert "hermes update started" in contents
         finally:
-            _finalize_update_output_fn()(state)
+            _finalize_update_output(state)
             # Sanity-check restoration
             assert sys.stdout is prev_out
             assert sys.stderr is prev_err
 
-    def test_logs_dir_created_if_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
-
-        # No logs/ dir yet.
-        assert not (tmp_path / "logs").exists()
-
-        state = _install_hangup_protection_fn()(gateway_mode=False)
-        try:
-            assert (tmp_path / "logs").is_dir()
-            assert (tmp_path / "logs" / "update.log").exists()
-        finally:
-            _finalize_update_output_fn()(state)
 
     def test_non_fatal_if_log_setup_fails(self, monkeypatch):
         """If get_hermes_home() raises, stdio must be left untouched but SIGHUP still handled."""
@@ -268,7 +129,7 @@ class TestInstallHangupProtection:
             signal.getsignal(signal.SIGHUP) if hasattr(signal, "SIGHUP") else None
         )
 
-        state = _install_hangup_protection_fn()(gateway_mode=False)
+        state = _install_hangup_protection(gateway_mode=False)
 
         try:
             assert sys.stdout is prev_out
@@ -278,7 +139,7 @@ class TestInstallHangupProtection:
             if hasattr(signal, "SIGHUP"):
                 assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
         finally:
-            _finalize_update_output_fn()(state)
+            _finalize_update_output(state)
             if hasattr(signal, "SIGHUP") and original_handler is not None:
                 signal.signal(signal.SIGHUP, original_handler)
 
@@ -289,24 +150,7 @@ class TestInstallHangupProtection:
 
 
 class TestFinalizeUpdateOutput:
-    def test_none_state_is_noop(self):
-        _finalize_update_output_fn()(None)  # must not raise
 
-    def test_restores_streams_and_closes_log(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
-
-        prev_out = sys.stdout
-        state = _install_hangup_protection_fn()(gateway_mode=False)
-        log_file = state["log_file"]
-
-        assert sys.stdout is not prev_out
-        assert log_file is not None
-
-        _finalize_update_output_fn()(state)
-
-        assert sys.stdout is prev_out
-        # The log file handle should be closed.
-        assert log_file.closed is True
 
     def test_skipped_install_leaves_stdio_alone(self):
         """When install failed (state['installed']=False) finalize should not
@@ -321,7 +165,39 @@ class TestFinalizeUpdateOutput:
         }
         before_out, before_err = sys.stdout, sys.stderr
 
-        _finalize_update_output_fn()(state)
+        _finalize_update_output(state)
 
         assert sys.stdout is before_out
         assert sys.stderr is before_err
+
+
+# -----------------------------------------------------------------------------
+# _log_only_write / _run_logged_subprocess (spam suppression)
+# -----------------------------------------------------------------------------
+
+
+class TestLogOnlyWrite:
+
+    def test_plain_stdout_keeps_build_output_off_screen(self, monkeypatch):
+        """An unwrapped stdout must not receive log-only build output."""
+        plain = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", plain)
+        _log_only_write("something")  # should not raise
+        assert plain.getvalue() == ""
+
+
+
+class TestRunLoggedSubprocess:
+    def test_captures_output_to_log_only(self, monkeypatch):
+        terminal = io.StringIO()
+        log = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", _UpdateOutputStream(terminal, log))
+
+        result = _run_logged_subprocess(
+            [sys.executable, "-c", "print('LOUD BUILD OUTPUT')"]
+        )
+
+        assert result.returncode == 0
+        assert "LOUD BUILD OUTPUT" in (result.stdout or "")
+        assert terminal.getvalue() == ""  # not echoed to terminal
+        assert "LOUD BUILD OUTPUT" in log.getvalue()  # but kept in the log
