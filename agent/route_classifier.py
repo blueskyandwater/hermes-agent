@@ -573,7 +573,9 @@ def get_route_model(
     to their parent route (code_or_debug) so they inherit its model config
     without requiring config.yaml changes.
     """
-    route_cfg = routing_config.get(route_type, {})
+    from agent.routing_roles import resolve_model_entry
+    roles = routing_config.get("roles", {})
+    route_cfg = resolve_model_entry(routing_config.get(route_type, {}), roles)
     if isinstance(route_cfg, dict):
         model = route_cfg.get("model", "")
         if model:
@@ -581,12 +583,13 @@ def get_route_model(
     # Sub-route alias fallback — inherit parent route's model
     alias = _ROUTE_MODEL_ALIASES.get(route_type)
     if alias:
-        alias_cfg = routing_config.get(alias, {})
+        alias_cfg = resolve_model_entry(routing_config.get(alias, {}), roles)
         if isinstance(alias_cfg, dict):
             model = alias_cfg.get("model", "")
             if model:
                 return model
-    return routing_config.get("fallback", "")
+    fallback = resolve_model_entry(routing_config.get("fallback", ""), roles)
+    return fallback.get("model", "") if isinstance(fallback, dict) else fallback
 
 
 def get_route_max_turns(

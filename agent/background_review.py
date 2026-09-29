@@ -1009,7 +1009,8 @@ def build_cache_parity_fork(
     # questions and still reject 30k+ token review contexts.
     _parent_routing = getattr(agent, "_routing_config", {})
     if isinstance(_parent_routing, dict):
-        _review_routing = dict(_parent_routing)
+        from agent.routing_roles import resolve_routing_roles
+        _review_routing = resolve_routing_roles(_parent_routing)
         _guard_model = ""
         for _route in ("long_context", "complex_task", "normal_chat"):
             _cfg = _review_routing.get(_route, {})

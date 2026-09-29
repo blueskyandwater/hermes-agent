@@ -2871,7 +2871,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "analytics", "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
+        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile", "role-model",
         "project", "proxy",
         "prompt-size",
         "resume",
@@ -3430,6 +3430,18 @@ def _build_cli_parser():
     chat_parser.set_defaults(func=cmd_chat)
 
     build_model_parser(subparsers, cmd_model=cmd_model)
+    # Verify a live Codex text completion before changing one existing routing role.
+    def _dispatch_role_model(args):
+        from hermes_cli.role_model_switch import cmd_role_model
+        raise SystemExit(cmd_role_model(args))
+
+    role_model_parser = subparsers.add_parser(
+        "role-model", help="Verify and switch one existing Codex routing role model"
+    )
+    role_model_parser.add_argument("--role", required=True, help="Existing routing.roles key (e.g. normal)")
+    role_model_parser.add_argument("--model", required=True, help="Codex model ID from the live catalog")
+    role_model_parser.set_defaults(func=_dispatch_role_model)
+
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)

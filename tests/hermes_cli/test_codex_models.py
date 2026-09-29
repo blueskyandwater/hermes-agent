@@ -18,6 +18,33 @@ def _codex_jwt(subject: str) -> str:
     return f"{header}.{payload}.test-signature"
 
 
+def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text('model = "gpt-5.2-codex"\n')
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-6-astra", "priority": 1, "supported_in_api": True},
+                    {"slug": "gpt-6-sol", "priority": 2, "supported_in_api": True},
+                    {"slug": "gpt-5.6-sol", "priority": 4, "supported_in_api": True},
+                    {"slug": "gpt-5-hidden-codex", "priority": 2, "visibility": "hidden"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    models = get_codex_model_ids()
+
+    assert models[0] == "gpt-5.2-codex"
+    assert "gpt-6-astra" not in models  # cache does not establish entitlement
+    assert "gpt-6-sol" in models
+    assert "gpt-5.6-sol" in models
+    assert "gpt-5-hidden-codex" not in models
+
+
 # dummy fixture value (not a real credential): a gateway pool key is opaque, never a JWT
 _GATEWAY_POOL_KEY = "dummy-gateway-pool-key"
 
@@ -37,6 +64,21 @@ def test_codex_catalog_never_offers_chatgpt_rejected_pro_slugs(monkeypatch, tmp_
 
     # The live catalog is authoritative: do not synthesize new wire slugs.
     assert _FORWARD_COMPAT_TEMPLATE_MODELS == []
+
+
+def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    models = get_codex_model_ids()
+
+    assert [model for model in models if not model.endswith("-900k")] == DEFAULT_CODEX_MODELS
+    assert "gpt-6-astra" not in models
+    assert "gpt-5.5" in models
+
+
+def test_get_codex_model_ids_does_not_synthesize_retired_forward_compat_models(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.codex_models._fetch_models_from_api", lambda access_token, **_kw: ["gpt-5.3-codex"]
     )
@@ -45,6 +87,8 @@ def test_codex_catalog_never_offers_chatgpt_rejected_pro_slugs(monkeypatch, tmp_
     assert "gpt-6-sol" not in live
     assert "gpt-5.3-codex-spark" not in live
     assert _pro_slugs(live) == []
+    # A partial live lineup must not resurrect static offline entries.
+    assert live == ["gpt-5.3-codex"]
 
 
 
@@ -83,10 +127,10 @@ def test_picker_never_synthesizes_900k_for_pro_or_unknown_slugs():
 
 
 
-
-
-def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
-    """Visible live entries survive supported_in_api=False; hidden entries do not."""
+def test_fetch_from_api_keeps_supported_in_api_false_visible_models(monkeypatch):
+    """``supported_in_api`` is public API availability, not OAuth-backed Codex availability.
+    Keep visible rows regardless; filter separately on visibility=hidden.
+    """
     import sys
     from hermes_cli import codex_models
 
@@ -96,7 +140,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
         def json(self):
             return {
                 "models": [
-                    {"slug": "gpt-6-sol", "priority": 0, "supported_in_api": True},
+                    {"slug": "gpt-6-astra", "priority": 0, "supported_in_api": True},
                     {"slug": "experimental-codex", "priority": 7, "supported_in_api": False},
                     {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
                 ]
@@ -111,7 +155,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
 
     models = codex_models._fetch_models_from_api(access_token=_codex_jwt("acct"))
 
-    assert "gpt-6-sol" in models
+    assert "gpt-6-astra" in models
     assert "experimental-codex" in models
     assert "gpt-5-internal" not in models
 
