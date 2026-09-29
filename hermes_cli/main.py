@@ -12844,6 +12844,18 @@ def main():
     )
     model_parser.set_defaults(func=cmd_model)
 
+    # Validate a Codex model with a live text completion before changing one routing role.
+    def _dispatch_role_model(args):
+        from hermes_cli.role_model_switch import cmd_role_model
+        raise SystemExit(cmd_role_model(args))
+
+    role_model_parser = subparsers.add_parser(
+        "role-model", help="Verify and switch one existing Codex routing role model"
+    )
+    role_model_parser.add_argument("--role", required=True, help="Existing routing.roles key (e.g. normal)")
+    role_model_parser.add_argument("--model", required=True, help="Codex model ID from the live catalog")
+    role_model_parser.set_defaults(func=_dispatch_role_model)
+
     # =========================================================================
     # fallback command — manage the fallback provider chain
     # =========================================================================
